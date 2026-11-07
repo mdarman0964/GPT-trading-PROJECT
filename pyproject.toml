@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xauusd-market-intelligence-research"
+version = "0.1.0"
+description = "Offline XAUUSD research foundation"
+requires-python = ">=3.10"
+dependencies = ["pandas>=2.0", "numpy>=1.24", "PyYAML>=6.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
