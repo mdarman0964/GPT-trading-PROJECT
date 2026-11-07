@@ -23,6 +23,10 @@ def main():
                    help="Commission converted to XAUUSD price units per side")
     b.add_argument("--allow-wide-spread", action="store_true",
                    help="Disable default spread/ATR filter")
+    b.add_argument("--trailing-activation-fraction", type=float, default=0.55)
+    b.add_argument("--trailing-distance-r", type=float, default=0.50)
+    b.add_argument("--trailing-lock-r", type=float, default=0.05)
+    b.add_argument("--no-trailing-stop", action="store_true")
     ab = sub.add_parser("account-backtest", help="Run dollar-denominated account simulation")
     ab.add_argument("--csv", required=True)
     ab.add_argument("--initial-balance", type=float, default=1000.0)
@@ -35,6 +39,10 @@ def main():
     ab.add_argument("--commission-usd-per-lot-round-turn", type=float, default=0.0)
     ab.add_argument("--slippage-per-side", type=float, default=0.0)
     ab.add_argument("--commission-per-side", type=float, default=0.0)
+    ab.add_argument("--trailing-activation-fraction", type=float, default=0.55)
+    ab.add_argument("--trailing-distance-r", type=float, default=0.50)
+    ab.add_argument("--trailing-lock-r", type=float, default=0.05)
+    ab.add_argument("--no-trailing-stop", action="store_true")
     ab.add_argument("--trades-out", default="output/account_trades.csv")
     ab.add_argument("--equity-out", default="output/equity_curve.csv")
     ab.add_argument("--report-out", default="output/account_report.json")
@@ -55,8 +63,13 @@ def main():
                           "note": "Research candidates only; not a backtest or profitability result."},
                          indent=2))
     elif args.cmd == "account-backtest":
-        base_cfg = BacktestConfig(slippage_per_side=args.slippage_per_side,
-                                  commission_per_side=args.commission_per_side)
+        base_cfg = BacktestConfig(
+            slippage_per_side=args.slippage_per_side,
+            commission_per_side=args.commission_per_side,
+            trailing_activation_fraction=None if args.no_trailing_stop else args.trailing_activation_fraction,
+            trailing_distance_r=args.trailing_distance_r,
+            trailing_lock_r=args.trailing_lock_r,
+        )
         raw_trades, _ = run_backtest(df, base_cfg)
         account_cfg = AccountConfig(
             initial_balance=args.initial_balance,
@@ -81,6 +94,9 @@ def main():
             slippage_per_side=args.slippage_per_side,
             commission_per_side=args.commission_per_side,
             require_spread_filter=not args.allow_wide_spread,
+            trailing_activation_fraction=None if args.no_trailing_stop else args.trailing_activation_fraction,
+            trailing_distance_r=args.trailing_distance_r,
+            trailing_lock_r=args.trailing_lock_r,
         )
         trades, report = run_backtest(df, cfg)
         write_report(trades, report, args.trades_out, args.report_out)

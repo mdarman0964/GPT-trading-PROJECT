@@ -1,14 +1,10 @@
 """Conservative bar-based hypothesis backtester.
 
-Important assumptions:
-- Signals are known only after their candle closes; entries occur at next bar open.
-- CSV spread is assumed to be an absolute XAUUSD price amount (e.g. 0.24),
-  not points. Confirm this against the broker's instrument specification.
-- Spread is charged half on each side. Slippage and commission are optional
-  price-unit equivalents per side; defaults are zero and must be configured.
-- If stop and target are both touched in one candle, stop is assumed first.
-- One open trade per hypothesis stream; no pyramiding or overlapping trades.
-This is research simulation only; it does not send broker orders.
+Signals are evaluated at candle close and entered at the next bar open.
+Spread is assumed to be an absolute XAUUSD price amount. Same-bar stop/target
+ambiguity is resolved stop-first. Trailing stops update only after a candle
+closes and become active on the next candle; this avoids assuming an unknown
+intrabar price path. Research only: this module never sends broker orders.
 """
 from __future__ import annotations
 
@@ -28,6 +24,10 @@ class BacktestConfig:
     slippage_per_side: float = 0.0
     commission_per_side: float = 0.0
     require_spread_filter: bool = True
+    # None disables trailing. Default activates at 55% of target progress.
+    trailing_activation_fraction: float | None = 0.55
+    trailing_distance_r: float = 0.50
+    trailing_lock_r: float = 0.05
 
     def validate(self) -> None:
         if self.stop_atr <= 0 or self.target_r <= 0:
@@ -36,6 +36,12 @@ class BacktestConfig:
             raise ValueError("max_hold_bars must be >= 1")
         if self.slippage_per_side < 0 or self.commission_per_side < 0:
             raise ValueError("Costs cannot be negative")
+        if self.trailing_activation_fraction is not None and not (
+            0 < self.trailing_activation_fraction < 1
+        ):
+            raise ValueError("trailing_activation_fraction must be between 0 and 1")
+        if self.trailing_distance_r <= 0 or self.trailing_lock_r < 0:
+            raise ValueError("trailing_distance_r must be positive and trailing_lock_r non-negative")
 
 
 SIGNALS = {
@@ -47,7 +53,6 @@ SIGNALS = {
 
 def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
                      cfg: BacktestConfig) -> list[dict]:
-    """Numpy-backed equivalent of the bar simulator; avoids millions of DataFrame iloc calls."""
     trades: list[dict] = []
     signals = df[signal_col].to_numpy(dtype=bool)
     spread_ok = df["spread_ok"].to_numpy(dtype=bool)
@@ -74,65 +79,99 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
         entry_i = i + 1
         entry_mid = float(open_[entry_i])
         entry_spread = float(spread[entry_i])
-        half_entry_cost = entry_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
+        entry_cost = entry_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
         distance = cfg.stop_atr * signal_atr
         if side == 1:
-            entry_fill = entry_mid + half_entry_cost
-            stop_level = entry_mid - distance
+            entry_fill = entry_mid + entry_cost
+            initial_stop = entry_mid - distance
             target_level = entry_mid + cfg.target_r * distance
+            activation_level = entry_mid + cfg.target_r * distance * (cfg.trailing_activation_fraction or 0)
         else:
-            entry_fill = entry_mid - half_entry_cost
-            stop_level = entry_mid + distance
+            entry_fill = entry_mid - entry_cost
+            initial_stop = entry_mid + distance
             target_level = entry_mid - cfg.target_r * distance
+            activation_level = entry_mid - cfg.target_r * distance * (cfg.trailing_activation_fraction or 0)
 
+        stop_level = initial_stop
+        trailing_active = False
+        best_favourable = entry_mid
         last_i = min(n - 1, entry_i + cfg.max_hold_bars - 1)
-        exit_i = last_i
-        exit_reason = "time"
-        exit_mid = float(close[last_i])
+        exit_i, exit_reason, exit_mid = last_i, "time", float(close[last_i])
 
         for j in range(entry_i, last_i + 1):
             o, h, l = float(open_[j]), float(high[j]), float(low[j])
+            # Stops already in force at the start of this candle are checked first.
             if side == 1:
                 if o <= stop_level:
-                    exit_i, exit_mid, exit_reason = j, o, "stop_gap"
+                    exit_i, exit_mid = j, o
+                    exit_reason = "trailing_stop_gap" if trailing_active else "stop_gap"
                     break
                 if o >= target_level:
                     exit_i, exit_mid, exit_reason = j, o, "target_gap"
                     break
                 if l <= stop_level:
-                    exit_i, exit_mid, exit_reason = j, stop_level, "stop"
+                    exit_i, exit_mid = j, stop_level
+                    exit_reason = "trailing_stop" if trailing_active else "stop"
                     break
                 if h >= target_level:
                     exit_i, exit_mid, exit_reason = j, target_level, "target"
                     break
+                best_favourable = max(best_favourable, h)
+                activated_now = (
+                    cfg.trailing_activation_fraction is not None
+                    and not trailing_active and h >= activation_level
+                )
+                if activated_now:
+                    trailing_active = True
+                if trailing_active:
+                    exit_cost_est = float(spread[j]) / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
+                    cost_covered_lock = entry_fill + exit_cost_est + cfg.trailing_lock_r * distance
+                    chandelier = best_favourable - cfg.trailing_distance_r * distance
+                    stop_level = max(stop_level, cost_covered_lock, chandelier)
             else:
                 if o >= stop_level:
-                    exit_i, exit_mid, exit_reason = j, o, "stop_gap"
+                    exit_i, exit_mid = j, o
+                    exit_reason = "trailing_stop_gap" if trailing_active else "stop_gap"
                     break
                 if o <= target_level:
                     exit_i, exit_mid, exit_reason = j, o, "target_gap"
                     break
                 if h >= stop_level:
-                    exit_i, exit_mid, exit_reason = j, stop_level, "stop"
+                    exit_i, exit_mid = j, stop_level
+                    exit_reason = "trailing_stop" if trailing_active else "stop"
                     break
                 if l <= target_level:
                     exit_i, exit_mid, exit_reason = j, target_level, "target"
                     break
+                best_favourable = min(best_favourable, l)
+                activated_now = (
+                    cfg.trailing_activation_fraction is not None
+                    and not trailing_active and l <= activation_level
+                )
+                if activated_now:
+                    trailing_active = True
+                if trailing_active:
+                    exit_cost_est = float(spread[j]) / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
+                    cost_covered_lock = entry_fill - exit_cost_est - cfg.trailing_lock_r * distance
+                    chandelier = best_favourable + cfg.trailing_distance_r * distance
+                    stop_level = min(stop_level, cost_covered_lock, chandelier)
 
         exit_spread = float(spread[exit_i])
-        half_exit_cost = exit_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
-        exit_fill = (exit_mid - half_exit_cost) if side == 1 else (exit_mid + half_exit_cost)
+        exit_cost = exit_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
+        exit_fill = exit_mid - exit_cost if side == 1 else exit_mid + exit_cost
         pnl = (exit_fill - entry_fill) * side
-        risk_distance = distance + half_entry_cost + half_exit_cost
+        risk_distance = distance + entry_cost + exit_cost
         trades.append({
             "hypothesis": signal_col, "side": "long" if side == 1 else "short",
-            "signal_time": times[i], "entry_time": times[entry_i],
-            "exit_time": times[exit_i],
+            "signal_time": times[i], "entry_time": times[entry_i], "exit_time": times[exit_i],
             "entry_index": entry_i, "exit_index": exit_i,
             "entry_mid": entry_mid, "entry_fill": entry_fill,
             "exit_mid": exit_mid, "exit_fill": exit_fill,
             "entry_spread": entry_spread, "exit_spread": exit_spread,
             "atr_at_signal": float(signal_atr), "stop_distance": distance,
+            "initial_stop": initial_stop, "final_stop": stop_level,
+            "trailing_activated": trailing_active,
+            "trailing_activation_fraction": cfg.trailing_activation_fraction,
             "risk_distance": risk_distance, "exit_reason": exit_reason,
             "pnl_price": pnl,
             "r_multiple": pnl / risk_distance if risk_distance > 0 else 0.0,
@@ -141,6 +180,7 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
         })
         i = exit_i + 1
     return trades
+
 
 def summarize(trades: pd.DataFrame) -> dict:
     if trades.empty:
@@ -163,6 +203,8 @@ def summarize(trades: pd.DataFrame) -> dict:
         "expectancy_r": float(trades["r_multiple"].mean()),
         "max_drawdown_r": float(drawdown.min()),
         "average_r": float(trades["r_multiple"].mean()),
+        "trailing_activated_trades": int(trades.get("trailing_activated", pd.Series(dtype=bool)).sum()),
+        "trailing_exit_trades": int(trades["exit_reason"].astype(str).str.startswith("trailing_stop").sum()),
     }
 
 
@@ -184,6 +226,8 @@ def run_backtest(df: pd.DataFrame, cfg: BacktestConfig = BacktestConfig()) -> tu
             "spread_unit": "Assumed absolute price units; verify broker specification",
             "signal_timing": "Signal candle close; entry next candle open",
             "same_bar_stop_target": "Stop first",
+            "trailing_stop": "Activation checked on candle extremes; stop updates at candle close and applies from next candle; no intrabar path assumed",
+            "trailing_lock": "At activation, stop seeks to lock trailing_lock_r beyond estimated round-trip costs; actual gaps/spread expansion can reduce realized profit",
             "overlap": "One position per hypothesis stream; streams are independent",
             "execution": "Historical simulation only; no broker orders",
         },
