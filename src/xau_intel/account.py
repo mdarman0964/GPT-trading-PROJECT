@@ -15,8 +15,8 @@ import pandas as pd
 class AccountConfig:
     initial_balance: float = 1000.0
     risk_fraction: float = 0.01
-    contract_size: float = 100.0
-    leverage: float = 100.0
+    contract_size: float | None = None
+    leverage: float | None = None
     min_lot: float = 0.01
     lot_step: float = 0.01
     max_lot: float = 100.0
@@ -27,7 +27,11 @@ class AccountConfig:
             raise ValueError("initial_balance must be positive")
         if not 0 < self.risk_fraction <= 0.05:
             raise ValueError("risk_fraction must be in (0, 0.05]")
-        for name in ("contract_size", "leverage", "min_lot", "lot_step", "max_lot"):
+        for name in ("contract_size", "leverage"):
+            value = getattr(self, name)
+            if value is None or value <= 0:
+                raise ValueError(f"{name} must be supplied from the broker specification and be positive")
+        for name in ("min_lot", "lot_step", "max_lot"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.min_lot > self.max_lot:
@@ -66,8 +70,6 @@ def run_account_backtest(trades: pd.DataFrame, cfg: AccountConfig = AccountConfi
             skipped_overlap += 1
             continue
 
-        entry_cost = float(t.entry_spread) / 2.0
-        exit_cost = float(t.exit_spread) / 2.0
         risk_per_unit_price = float(t.risk_distance)
         if risk_per_unit_price <= 0:
             continue
