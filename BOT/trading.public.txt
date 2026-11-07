@@ -1,0 +1,4504 @@
+openapi: 3.1.1
+
+info:
+  title: Exness Trader API
+  version: 1.0.2
+  description: |
+
+    Clean domain model:
+    - Order = trading instruction
+    - Position = open exposure
+    - Operational and Trading history via Trading
+    - Realtime updates via Server Events
+    - Static and semi-static settings via Configuration
+
+    General API rules:
+
+    Authorization:
+    - The primary Public Trader API authentication method is request signing with a public API key.
+    - Signed requests use the `EXN-*` headers documented in the security schemes.
+    - `EXN-DATA` contains a base64url-encoded JSON payload with the fields that are signed.
+    - `EXN-SIGN` contains the Ed25519 signature of the decoded `EXN-DATA` payload.
+    - `EXN-DATA` and `EXN-SIGN` must use base64url without `=` padding.
+    - `EXN-SIGN-VERSION` must be `1`.
+    - The signed payload must contain:
+      - `api_key`: same value as `EXN-API-KEY`
+      - `idempotency_key`: same value as `EXN-IDEMPOTENCY-KEY`; empty string for signed `GET` requests
+      - `timestamp`: Unix time in milliseconds, same value as `EXN-TIMESTAMP`
+      - `sign_version`: same value as `EXN-SIGN-VERSION`
+      - `method`: uppercase HTTP method, for example `POST`
+      - `path`: request path with query string exactly as sent by the client
+      - `body_hash`: SHA-256 hash of the request body, base64url-encoded without padding
+    - `EXN-SIGN` signs the decoded `EXN-DATA` payload bytes, not the base64url string.
+    - For requests without a body, `body_hash` is the SHA-256 hash of the empty string, base64url-encoded without padding.
+    - Query strings must be signed exactly as transmitted. Clients must not reorder or re-encode query parameters after signing.
+    - Duplicate query parameters are rejected.
+    - The timestamp must be close to the server time. Clients should generate a fresh signature for every request.
+    - The API key must be allowed to access the requested account, source IP, and operation scope.
+    - Authentication headers are modeled as OpenAPI security schemes, not as ordinary operation parameters.
+      This keeps generated clients and Swagger UI from showing duplicate credential inputs.
+    - Authentication errors use the public error model. Clients should use `error.code` and `error_message`
+      as the stable contract and must not rely on internal diagnostic text.
+
+    Signed POST example:
+    ```http
+    POST /v1/trading/accounts/123456789/orders HTTP/1.1
+    EXN-API-KEY: exnsk-live-example
+    EXN-IDEMPOTENCY-KEY: order-20260316-0001
+    EXN-TIMESTAMP: 1773656070123
+    EXN-SIGN-VERSION: 1
+    EXN-DATA: <base64url_encoded_payload>
+    EXN-SIGN: <base64url_encoded_signature>
+    Content-Type: application/json
+    ```
+
+    Decoded `EXN-DATA` payload for the signed POST:
+    ```json
+    {
+      "api_key": "exnsk-live-example",
+      "idempotency_key": "order-20260316-0001",
+      "timestamp": 1773656070123,
+      "sign_version": 1,
+      "method": "POST",
+      "path": "/v1/trading/accounts/123456789/orders",
+      "body_hash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+    }
+    ```
+
+    Signed GET example:
+    ```http
+    GET /v1/configuration/accounts/123456789/account HTTP/1.1
+    EXN-API-KEY: exnsk-live-example
+    EXN-IDEMPOTENCY-KEY:
+    EXN-TIMESTAMP: 1773656070123
+    EXN-SIGN-VERSION: 1
+    EXN-DATA: <base64url_encoded_payload>
+    EXN-SIGN: <base64url_encoded_signature>
+    ```
+
+    Decoded `EXN-DATA` payload for the signed GET:
+    ```json
+    {
+      "api_key": "exnsk-live-example",
+      "idempotency_key": "",
+      "timestamp": 1773656070123,
+      "sign_version": 1,
+      "method": "GET",
+      "path": "/v1/configuration/accounts/123456789/account",
+      "body_hash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+    }
+    ```
+
+    Date and time:
+    - all date-time values are returned in UTC
+    - ISO 8601 format with explicit offset is used, for example: `2026-03-16T12:54:30+00:00`
+
+    Pagination:
+    - cursor is an opaque continuation token
+    - cursor must not be parsed or modified by the client
+    - when cursor is used, it cannot be combined with filters except `limit`, unless explicitly stated otherwise
+
+    Sorting:
+    - historical collections are returned in ascending chronological order, from older to newer, unless explicitly stated otherwise
+
+    Monetary values and numeric precision:
+    - account monetary values are represented as decimal strings, expressed in the account currency, and rounded according to the decimal precision of that currency
+    - examples with 2 decimal places assume an account currency that uses 2 decimal places
+    - trading volumes are represented as decimal strings to avoid precision loss
+    - trading request/entity price fields are represented as decimal strings to avoid precision loss
+    - market data prices, including tick bid/ask and candle OHLC values, are represented as JSON numbers and modeled in OpenAPI as `type: number`, `format: double`
+    - volume and instrument price precision are instrument-specific and must not be inferred from account currency precision
+
+    Idempotency:
+    - mutating trading methods require an idempotency key
+    - signed requests use `EXN-IDEMPOTENCY-KEY`
+    - for signed `GET` requests, `EXN-IDEMPOTENCY-KEY` must be present with an empty value,
+      and the signed `idempotency_key` field must be an empty string
+    - clients should use the same idempotency key when safely retrying the same request
+    - if the same idempotency key is reused for the same account, operation kind, and request payload,
+      the duplicate request is accepted with the original `operation_id` and is not executed again
+    - if the same idempotency key is reused for the same account and operation kind with a different
+      request payload, the request is rejected as a duplicate key conflict
+    - idempotency records are retained for a limited time; after the retention period expires, the same key may
+      be treated as a new request
+    - when an idempotency key is provided, it is echoed back as `client_request_id` in the ACK response,
+      in the corresponding `transaction_event`, and in the operation status response;
+      this allows correlating events with originating requests without storing the `operation_id` mapping
+    - idempotency key length must be 5..128 characters
+    - allowed characters are `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`, `~`
+
+    Async trading operations:
+    - mutating trading methods return ACK with `operation_id`
+    - final execution result is delivered through Server Events and can be read from operation status
+    - clients should use `operation_id` or `client_request_id` to correlate REST requests with operation and transaction events
+    - REST errors before ACK are limited to synchronous request, authentication, authorization, account lookup,
+      rate limit, and service availability failures
+    - trading-rule and execution failures after ACK are represented by public `error_code` and `error_message`
+      fields in `transaction_event` and operation status payloads
+    - operation-level `x-public-error-codes` lists synchronous REST error codes
+    - operation-level `x-public-async-error-codes` lists final asynchronous trading result codes
+
+    Current state vs history:
+    - current trading state is available through Trading Snapshot and Server Events
+    - historical closed orders and deals are available through Trading History
+    - open orders and open positions are not returned by Trading History
+
+
+security:
+  - ExnApiKeyAuth: []
+    ExnTimestampAuth: []
+    ExnDataAuth: []
+    ExnSignatureAuth: []
+    ExnSignVersionAuth: []
+    ExnIdempotencyKeyAuth: []
+
+servers:
+  - url: /
+
+tags:
+  - name: Historical Market Data
+    description: Historical market data such as candles.
+  - name: Trading
+    description: Trading operations for orders and positions.
+  - name: Server Events
+    description: |
+      Server events provide realtime updates using WebSocket connections:
+      - The events stream is used for trading events, periodic account state events, and HMR period events.
+      - The ticks stream is used for market prices.
+
+      Recovery guarantees and limits:
+      - WebSocket streams are realtime streams and do not provide durable replay, resume tokens, or gap-fill by event id.
+      - After reconnect, the client must create a new WebSocket connection and resubscribe.
+      - State recovery is snapshot-based: use the initial `trading_state_snapshot` from `transactions` subscription
+        or the initial `hmr_snapshot` from `hmr` subscription as the baseline for the corresponding stream state.
+        Use `GET /v1/trading/accounts/{account_id}/snapshot` to reconcile current open orders, open positions,
+        and account state.
+      - Operation outcome recovery is operation-id based: if a REST ACK was received but the corresponding
+        `transaction_event` was not observed, use `GET /v1/trading/accounts/{account_id}/operations/{operation_id}`
+        while the operation status is retained.
+
+      WebSocket protection (enforced per account, per server node; configurable):
+      - Active connections: at most `max_active_connections` concurrent WebSocket
+        connections per account. Connections beyond the limit are rejected at the handshake with HTTP 429.
+      - Connection rate: new connections must pass both the global and endpoint `connection_rate`
+        buckets; connections exceeding either rate are rejected at the handshake with HTTP 429.
+      - Inbound messages: each client message (subscribe, unsubscribe, ping, custom) is validated,
+        must not exceed `max_inbound_message_bytes`, and is subject to an inbound-message rate limit
+        (`inbound_message_rate`) globally and for the selected endpoint. Oversized frames are rejected
+        and count as strikes; throttled messages are dropped.
+      - Subscription operations: subscribe operations are rate-limited per endpoint
+        (`subscription_operation_rate`);
+        a request over N instruments counts as N subscription operations. Unsubscribe operations are
+        not subject to `subscription_operation_rate`, but remain subject to `inbound_message_rate`.
+        The total number of subscriptions is not limited.
+      - Strikes: a strike is recorded when a client subscribes to a non-existent instrument or
+        unsubscribes from an instrument it is not currently subscribed to. When strikes exceed
+        `strikes.threshold` within the decay window, the connection is terminated with a policy-violation
+        close (RFC 6455 code 1008).
+      - Slow consumers: each connection has a bounded outbound send queue. If the client cannot keep
+        up and the queue overflows, the connection is terminated with a policy-violation close rather
+        than buffering indefinitely.
+      - Current limit values are returned by `GET /v1/configuration/accounts/{account_id}/limits`
+        under `limits.websocket`.
+  - name: Configuration
+    description: Configuration and reference data required for API usage.
+
+paths:
+  /v1/market-data/accounts/{account_id}/candles:
+    get:
+      tags:
+        - Historical Market Data
+      summary: Get candle history
+      description: |
+        Returns historical candles for the selected instrument and timeframe.
+
+        Note:
+        Candle history is available for:
+        - ask
+        - bid
+        - both ask and bid
+
+        Rules:
+        - 'from' is required
+        - use either:
+          - from + count
+          - or from + to
+        - 'from' must be earlier than `to`
+        - 'count' is bidirectional and its absolute value must not exceed the configured candle limit
+        - if 'to' is used, the requested range must not exceed the configured candle limit
+        - retrieve the current limit from `GET /v1/configuration/accounts/{account_id}/limits`
+        - returned candles are sorted in ascending time order, from older to newer
+
+        Time range semantics:
+        - `from` is inclusive
+        - `to` is exclusive
+        - A candle is included if its open time is greater than or equal to `from` and strictly less than `to`
+        - Example: for H1 candles, `from=12:00`, `to=13:00` returns the candle with open time `12:00`, not a separate `13:00` candle.
+
+        Historical data availability depends on timeframe:
+        - S1 → 1 day
+        - S5 → 5 days
+        - S15 → 15 days
+        - M1, M3 → 1 year
+        - M5, M10 → 2 years
+        - M15, M30 → 3 years
+        - H1+ → full available history
+
+        Possible public error codes include:
+        - `REQUEST_INVALID_PARAMETERS`
+        - `REQUEST_INVALID_TIMEFRAME`
+        - `REQUEST_INVALID_TIME_RANGE`
+        - `REQUEST_INVALID_COUNT`
+        - `REQUEST_INVALID_PRICE_TYPE`
+        - `MARKET_INSTRUMENT_NOT_FOUND`
+        - `MARKET_NO_QUOTES`
+      operationId: getCandleHistory
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_TIMEFRAME
+        - REQUEST_INVALID_TIME_RANGE
+        - REQUEST_INVALID_COUNT
+        - REQUEST_INVALID_PRICE_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_NO_QUOTES
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+        - name: instrument
+          in: query
+          required: true
+          description: Instrument symbolic identifier
+          schema:
+            $ref: "#/components/schemas/InstrumentName"
+        - name: price_type
+          in: query
+          required: false
+          description: Candle price type.
+          schema:
+            type: string
+            enum:
+              - bid
+              - ask
+              - both
+            default: bid
+        - name: timeframe
+          in: query
+          required: true
+          description: Candle timeframe
+          schema:
+            type: string
+            enum:
+              - "S1"
+              - "S5"
+              - "S15"
+              - "M1"
+              - "M3"
+              - "M5"
+              - "M10"
+              - "M15"
+              - "M30"
+              - "H1"
+              - "H2"
+              - "H4"
+              - "D1"
+              - "W1"
+              - "MN"
+            example: "M15"
+        - name: from
+          in: query
+          required: true
+          description: Start of requested time range
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Must not exceed the configured candle count from `GET /v1/configuration/accounts/{account_id}/limits`.
+          schema:
+            type: string
+            format: date-time
+        - name: count
+          in: query
+          required: false
+          description: Cannot be used together with 'to'. Must be non-zero and within the configured absolute candle limit.
+          schema:
+            oneOf:
+              - type: integer
+                maximum: -1
+              - type: integer
+                minimum: 1
+      responses:
+        "200":
+          description: Candle history returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CandleHistoryResponse"
+              examples:
+                bidCandles:
+                  summary: Bid candles
+                  value:
+                    candles:
+                      - time: "2026-03-16T12:54:30+00:00"
+                        open: 1.08321
+                        high: 1.08350
+                        low: 1.08310
+                        close: 1.08340
+                        volume: 124
+                askCandles:
+                  summary: Ask candles
+                  value:
+                    candles:
+                      - time: "2026-03-16T12:54:30+00:00"
+                        open: 1.08331
+                        high: 1.08360
+                        low: 1.08320
+                        close: 1.08350
+                        volume: 124
+                bidAskCandles:
+                  summary: Bid and ask candles
+                  value:
+                    candles:
+                      - time: "2026-03-16T12:54:30+00:00"
+                        bid:
+                          open: 1.08321
+                          high: 1.08350
+                          low: 1.08310
+                          close: 1.08340
+                        ask:
+                          open: 1.08331
+                          high: 1.08360
+                          low: 1.08320
+                          close: 1.08350
+                        volume: 124
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/trading/accounts/{account_id}/orders:
+    post:
+      tags:
+        - Trading
+      summary: Place pending order
+      description: |
+        Creates a new pending order or sets SL/TP for a position with a new SLTP order. Order type may be:
+        - limit
+        - stop
+        - sltp
+
+        Market orders are not accepted by this method.
+        To open a position with immediate execution, use `POST /v1/trading/accounts/{account_id}/positions`.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+        - unavailable if account_status is close_only, except for SLTP orders
+
+        Instrument-specific request validation:
+        - resolve validation inputs from `GET /v1/configuration/accounts/{account_id}/instruments/{instrument}/conditions`
+        - `volume` must satisfy `volume_min`, `volume_max`, and `volume_step`
+        - request price fields (`price`, `stop_loss_price`, `take_profit_price`) must use at most `point_digits` fractional digits
+        - the implied minimum price increment is `10^-point_digits`
+
+        The method returns ACK response.
+        Final transaction result is delivered through Server Events.
+
+        Consistency and recovery notes:
+        - Closed positions and final-state orders are retained for 1 month (subject to clarification).
+        - If `operation_id` is not received in the REST ACK response, or is not received in Server events subscription, or an unknown `operation_id` is received, the client should restart Server events subscription and reconcile state using snapshots of currently open positions and pending orders.
+
+        Synchronous REST errors are returned before the ACK response and cover request shape,
+        authentication, authorization, account lookup, rate limiting, and temporary service availability.
+
+        Asynchronous final operation errors are delivered through `transaction_event` and operation status.
+        Possible public final error codes include:
+        - `ACCOUNT_DISABLED`
+        - `ACCOUNT_CLOSE_ONLY`
+        - `REQUEST_INVALID`
+        - `REQUEST_INVALID_PRICE`
+        - `MARKET_INSTRUMENT_NOT_FOUND`
+        - `MARKET_TRADE_DISABLED`
+        - `MARKET_CLOSE_ONLY`
+        - `MARKET_SESSION_CLOSED`
+        - `MARKET_NO_QUOTES`
+        - `TRADING_RULE_VOLUME_TOO_SMALL`
+        - `TRADING_RULE_VOLUME_TOO_LARGE`
+        - `TRADING_RULE_INVALID_VOLUME_STEP`
+        - `TRADING_RULE_INVALID_PRICE_LEVELS`
+        - `TRADING_RULE_INSUFFICIENT_MARGIN`
+        - `TRADING_RULE_MARGIN_LEVEL_TOO_LOW`
+        - `TRADING_RULE_OPERATION_RESTRICTED`
+        - `TRADING_RULE_TOO_MANY_PENDING_ORDERS`
+        - `EXECUTION_REQUOTE`
+        - `EXECUTION_REJECTED`
+        - `SYSTEM_RATE_LIMIT`
+        - `SYSTEM_TEMPORARY_UNAVAILABLE`
+      x-runtime-restrictions:
+        - trading_disabled
+        - close_only
+      operationId: placePendingOrder
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_PRICE
+        - REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - ACCOUNT_CLOSE_ONLY
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_PRICE
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_TRADE_DISABLED
+        - MARKET_CLOSE_ONLY
+        - MARKET_SESSION_CLOSED
+        - MARKET_NO_QUOTES
+        - TRADING_RULE_INVALID_VOLUME
+        - TRADING_RULE_VOLUME_TOO_SMALL
+        - TRADING_RULE_VOLUME_TOO_LARGE
+        - TRADING_RULE_INVALID_VOLUME_STEP
+        - TRADING_RULE_INVALID_PRICE_LEVELS
+        - TRADING_RULE_INSUFFICIENT_MARGIN
+        - TRADING_RULE_MARGIN_LEVEL_TOO_LOW
+        - TRADING_RULE_OPERATION_RESTRICTED
+        - TRADING_RULE_TOO_MANY_PENDING_ORDERS
+        - EXECUTION_REQUOTE
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewPendingOrderRequest"
+      responses:
+        "202":
+          description: ACK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/trading/accounts/{account_id}/orders/{order_id}:
+    patch:
+      tags:
+        - Trading
+      summary: Modify active order
+      description: |
+        Modifies active pending or SLTP order parameters.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+        - unavailable if account_status is close_only
+
+        Supported changes:
+        - price
+        - stop_loss_price
+        - take_profit_price
+
+        For `stop_loss_price` and `take_profit_price`:
+        - omitted field is not changed
+        - string value sets a new SL/TP price
+        - `null` removes the corresponding SL/TP value
+
+        The method returns ACK response.
+        Final transaction result is delivered through Server Events.
+
+        Consistency and recovery notes:
+        - Closed positions and final-state orders are retained for 1 month (subject to clarification).
+        - If `operation_id` is not received in the REST ACK response, or is not received in Server events subscription, or an unknown `operation_id` is received, the client should restart Server events subscription and reconcile state using snapshots of currently open positions and pending orders.
+      x-runtime-restrictions:
+        - trading_disabled
+        - close_only
+      operationId: modifyOrder
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_ORDER_NOT_FOUND
+        - REQUEST_INVALID_PRICE
+        - REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - ACCOUNT_CLOSE_ONLY
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_ORDER_NOT_FOUND
+        - REQUEST_INVALID_PRICE
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_TRADE_DISABLED
+        - MARKET_CLOSE_ONLY
+        - MARKET_SESSION_CLOSED
+        - MARKET_NO_QUOTES
+        - TRADING_RULE_INVALID_PRICE_LEVELS
+        - EXECUTION_REQUOTE
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+        - name: order_id
+          in: path
+          required: true
+          description: Order identifier
+          schema:
+            $ref: "#/components/schemas/UInt64String"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModifyOrderRequest"
+      responses:
+        "202":
+          description: ACK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    delete:
+      tags:
+        - Trading
+      summary: Cancel pending or SLTP order
+      description: |
+       Cancels the selected pending or SLTP order.
+
+       Runtime restrictions:
+       - unavailable if trade_mode is trading_disabled
+
+       Rules:
+       - pending and SLTP orders can be cancelled
+       - filled, cancelled, or rejected orders cannot be cancelled
+       - if the order is not found or is no longer cancellable, the request is rejected
+
+       The method returns ACK response.
+       Final transaction result is delivered through Server Events.
+
+       Consistency and recovery notes:
+       - Closed positions and final-state orders are retained for 1 month (subject to clarification).
+       - If `operation_id` is not received in the REST ACK response, or is not received in Server events subscription, or an unknown `operation_id` is received the client should restart Server events subscription and reconcile state using snapshots of currently open positions and pending orders.
+
+      x-runtime-restrictions:
+       - trading_disabled
+      operationId: cancelPendingOrder
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_ORDER_NOT_FOUND
+        - REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_ORDER_NOT_FOUND
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+        - name: order_id
+          in: path
+          required: true
+          description: Order identifier
+          schema:
+            $ref: "#/components/schemas/UInt64String"
+      responses:
+        "202":
+          description: ACK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/trading/accounts/{account_id}/positions:
+    post:
+      tags:
+        - Trading
+      summary: Open position
+      description: |
+        Opens a new position using immediate market execution.
+
+        This method represents the client intent to open exposure.
+        The resulting transaction may include an order, deal, position and account_state.
+        On position open, account_state may change because used margin is recalculated; if opening commission is charged, balance changes as well.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+        - unavailable if account_status is close_only
+
+        Instrument-specific request validation:
+        - resolve validation inputs from `GET /v1/configuration/accounts/{account_id}/instruments/{instrument}/conditions`
+        - `volume` must satisfy `volume_min`, `volume_max`, and `volume_step`
+        - request price fields (`price`, `stop_loss_price`, `take_profit_price`) must use at most `point_digits` fractional digits
+        - the implied minimum price increment is `10^-point_digits`
+
+        The method returns ACK response.
+        Final transaction result is delivered through Server Events.
+
+        Consistency and recovery notes:
+        - Closed positions and final-state orders are retained for 1 month (subject to clarification).
+        - If `operation_id` is not received in the REST ACK response, or is not received in Server events subscription, or an unknown `operation_id` is received, the client should restart Server events subscription and reconcile state using snapshots of currently open positions and pending orders.
+
+        Synchronous REST errors are returned before the ACK response and cover request shape,
+        authentication, authorization, account lookup, rate limiting, and temporary service availability.
+
+        Asynchronous final operation errors are delivered through `transaction_event` and operation status.
+        Possible public final error codes include:
+        - `ACCOUNT_DISABLED`
+        - `ACCOUNT_CLOSE_ONLY`
+        - `REQUEST_INVALID`
+        - `REQUEST_INVALID_PRICE`
+        - `MARKET_INSTRUMENT_NOT_FOUND`
+        - `MARKET_TRADE_DISABLED`
+        - `MARKET_CLOSE_ONLY`
+        - `MARKET_SESSION_CLOSED`
+        - `MARKET_NO_QUOTES`
+        - `TRADING_RULE_VOLUME_TOO_SMALL`
+        - `TRADING_RULE_VOLUME_TOO_LARGE`
+        - `TRADING_RULE_INVALID_VOLUME_STEP`
+        - `TRADING_RULE_INVALID_PRICE_LEVELS`
+        - `TRADING_RULE_INSUFFICIENT_MARGIN`
+        - `TRADING_RULE_MARGIN_LEVEL_TOO_LOW`
+        - `TRADING_RULE_OPERATION_RESTRICTED`
+        - `TRADING_RULE_TOO_MANY_OPEN_POSITIONS`
+        - `EXECUTION_REQUOTE`
+        - `EXECUTION_REJECTED`
+        - `SYSTEM_RATE_LIMIT`
+        - `SYSTEM_TEMPORARY_UNAVAILABLE`
+      x-runtime-restrictions:
+        - trading_disabled
+        - close_only
+      operationId: openPosition
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_PRICE
+        - REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - ACCOUNT_CLOSE_ONLY
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_PRICE
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_TRADE_DISABLED
+        - MARKET_CLOSE_ONLY
+        - MARKET_SESSION_CLOSED
+        - MARKET_NO_QUOTES
+        - TRADING_RULE_INVALID_VOLUME
+        - TRADING_RULE_VOLUME_TOO_SMALL
+        - TRADING_RULE_VOLUME_TOO_LARGE
+        - TRADING_RULE_INVALID_VOLUME_STEP
+        - TRADING_RULE_INVALID_PRICE_LEVELS
+        - TRADING_RULE_INSUFFICIENT_MARGIN
+        - TRADING_RULE_MARGIN_LEVEL_TOO_LOW
+        - TRADING_RULE_OPERATION_RESTRICTED
+        - TRADING_RULE_TOO_MANY_OPEN_POSITIONS
+        - EXECUTION_REQUOTE
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenPositionRequest"
+      responses:
+        "202":
+          description: ACK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/trading/accounts/{account_id}/positions/{position_id}:
+    delete:
+      tags:
+        - Trading
+      summary: Close position
+      description: |
+        Closes the selected open position.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+
+        The method supports both:
+        - full close
+        - partial close
+
+        Rules:
+        - if volume is omitted, the whole remaining position volume is closed
+        - if volume is provided, partial close is performed
+        - volume must be greater than 0, except close-by requests where `volume=0` is accepted
+          and treated the same as an omitted volume
+        - volume must not exceed current open position volume
+
+        The method returns ACK response.
+        Final transaction result is delivered through Server Events.
+
+        Supported filters:
+        - volume: for partial close
+        - price
+        - deviation: optional maximum allowed price deviation for position close execution, expressed in points
+        - close_by_position_id
+
+        Consistency and recovery notes:
+        - Closed positions and final-state orders are retained for 1 month (subject to clarification).
+        - If `operation_id` is not received in the REST ACK response, or is not received in Server events subscription, or an unknown `operation_id` is received, the client should restart Server events subscription and reconcile state using snapshots of currently open positions and pending orders.
+      x-runtime-restrictions:
+        - trading_disabled
+      operationId: closePosition
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_POSITION_NOT_FOUND
+        - REQUEST_INVALID_PRICE
+        - REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_POSITION_NOT_FOUND
+        - REQUEST_INVALID_PRICE
+        - MARKET_TRADE_DISABLED
+        - MARKET_SESSION_CLOSED
+        - MARKET_NO_QUOTES
+        - TRADING_RULE_INVALID_VOLUME
+        - TRADING_RULE_VOLUME_TOO_SMALL
+        - TRADING_RULE_VOLUME_TOO_LARGE
+        - TRADING_RULE_INVALID_VOLUME_STEP
+        - TRADING_RULE_INVALID_REMAINING_VOLUME
+        - TRADING_RULE_MARGIN_LEVEL_TOO_LOW
+        - TRADING_RULE_OPERATION_RESTRICTED
+        - EXECUTION_REQUOTE
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+        - name: position_id
+          in: path
+          required: true
+          description: Position identifier
+          schema:
+            $ref: "#/components/schemas/UInt64String"
+        - name: volume
+          in: query
+          required: false
+          description: |
+            Optional close volume.
+
+            If omitted, full close is performed.
+            If provided, partial close is performed.
+            For close-by requests with `close_by_position_id`, zero values such as `0`, `0.0`,
+            and `0.00` are accepted and treated the same as an omitted volume.
+          schema:
+            $ref: "#/components/schemas/ClosePositionVolumeString"
+        - name: price
+          in: query
+          required: false
+          description: |
+            Optional requested close price.
+            Applicable for execution modes where price is required or supported.
+          schema:
+            $ref: "#/components/schemas/InstrumentPriceString"
+        - name: deviation
+          in: query
+          required: false
+          description: |
+            Optional maximum allowed price deviation for position close execution, expressed in points.
+
+            The field is applicable only when a requested execution price is provided.
+
+            For instant execution:
+            - if the execution price differs from the requested price within the specified deviation, the order may be executed at the new price without requote
+            - if the difference exceeds the specified deviation, the request may be rejected with requote
+
+            For market execution:
+            - execution is performed at the available market price
+            - deviation will be ignored
+
+            If `deviation` is omitted, no explicit deviation tolerance is provided by the client.
+            In this case, instant execution requires execution at the requested price or may result in requote.
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/DecimalString"
+            example: "2.5"
+        - name: close_by_position_id
+          in: query
+          required: false
+          description: |
+             Opposite position identifier for close-by operation.
+             Applicable only for account models and instruments where close-by is supported.
+          schema:
+            $ref: "#/components/schemas/UInt64String"
+      responses:
+        "202":
+          description: ACK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/trading/accounts/{account_id}/snapshot:
+    get:
+      tags:
+        - Trading
+      summary: Get snapshot
+      description: |
+        Returns the current trading state snapshot for the selected account.
+
+        The payload matches the `trading_state_snapshot` event delivered through
+        the trading events stream.
+
+        The snapshot contains current open orders, open positions, and account_state.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+      x-runtime-restrictions:
+        - trading_disabled
+      operationId: getTradingStateSnapshot
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      responses:
+        "200":
+          description: Trading state snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradingStateSnapshot"
+              examples:
+                snapshot:
+                  summary: Snapshot
+                  value:
+                    orders:
+                      - order_id: "1001"
+                        order_type: limit
+                        state: placed
+                        direction: buy
+                        instrument: EURUSD
+                        price: "1.0800"
+                        volume: "1.0"
+                        stop_loss_price: "1.0750"
+                        take_profit_price: "1.0900"
+                        create_time: "2026-12-14T11:46:30+00:00"
+                    positions:
+                      - position_id: "2001"
+                        direction: buy
+                        instrument: EURUSD
+                        initial_volume: "1.0"
+                        volume: "1.0"
+                        open_price: "1.0800"
+                        state: open
+                        margin_rate: "1.0"
+                        create_time: "2026-12-14T11:46:30+00:00"
+                        commission: "0"
+                        swap: "0"
+                    account_state:
+                      balance: "10000.00"
+                      equity: "10000.00"
+                      used_margin: "100.00"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/trading/accounts/{account_id}/operations/{operation_id}:
+    get:
+      tags:
+        - Trading
+      summary: Get operation status
+      description: |
+        Returns the current status of an asynchronous trading operation.
+
+        Use this endpoint to poll for the result of a trading operation when the
+        corresponding `transaction_event` is not received through the Trading events
+        subscription within an expected time window.
+
+        Rules:
+        - the operation must belong to the specified account
+        - pending operations may transition to a terminal state at any time
+        - operations are retained for 24 hours
+
+        Operation status values:
+        - `pending`: the operation has been accepted and is being processed
+        - `confirmed`: the operation completed successfully; state changes are reflected in the account
+        - `rejected`: the operation was rejected by trading rules or risk checks
+        - `failed`: the operation could not be processed due to an internal error
+      operationId: getOperationStatus
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_OPERATION_NOT_FOUND
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - ACCOUNT_CLOSE_ONLY
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_PRICE
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_TRADE_DISABLED
+        - MARKET_CLOSE_ONLY
+        - MARKET_SESSION_CLOSED
+        - MARKET_NO_QUOTES
+        - TRADING_RULE_INVALID_VOLUME
+        - TRADING_RULE_VOLUME_TOO_SMALL
+        - TRADING_RULE_VOLUME_TOO_LARGE
+        - TRADING_RULE_INVALID_VOLUME_STEP
+        - TRADING_RULE_INVALID_REMAINING_VOLUME
+        - TRADING_RULE_INVALID_PRICE_LEVELS
+        - TRADING_RULE_INSUFFICIENT_MARGIN
+        - TRADING_RULE_MARGIN_LEVEL_TOO_LOW
+        - TRADING_RULE_OPERATION_RESTRICTED
+        - TRADING_RULE_TOO_MANY_PENDING_ORDERS
+        - TRADING_RULE_TOO_MANY_OPEN_POSITIONS
+        - EXECUTION_REQUOTE
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+        - name: operation_id
+          in: path
+          required: true
+          description: Operation identifier returned in the ACK response
+          schema:
+            $ref: "#/components/schemas/UInt64String"
+      responses:
+        "200":
+          description: Operation status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationStatusResponse"
+              examples:
+                confirmed:
+                  summary: Confirmed
+                  value:
+                    operation_id: "789"
+                    status: confirmed
+                    created_at: "2026-05-11T10:00:00.000000Z"
+                    updated_at: "2026-05-11T10:00:00.123000Z"
+                pending:
+                  summary: Pending
+                  value:
+                    operation_id: "790"
+                    status: pending
+                    created_at: "2026-05-11T10:00:00.000000Z"
+                    updated_at: "2026-05-11T10:00:00.000000Z"
+                rejected:
+                  summary: Rejected
+                  value:
+                    operation_id: "791"
+                    status: rejected
+                    error_code: 5005
+                    error_message: TRADING_RULE_INVALID_PRICE_LEVELS
+                    created_at: "2026-05-11T10:00:00.000000Z"
+                    updated_at: "2026-05-11T10:00:00.050000Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Operation or account not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                operation_not_found:
+                  value:
+                    code: 3014
+                    error_message: REQUEST_OPERATION_NOT_FOUND
+                account_not_found:
+                  value:
+                    code: 2000
+                    error_message: ACCOUNT_NOT_FOUND
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/history/accounts/{account_id}/orders:
+    get:
+      tags:
+        - Trading
+      summary: Get orders history
+      description: |
+          Returns historical closed orders within the configured history age and range limits.
+
+          Orders:
+          - available order states: filled, cancelled, rejected
+          - open, placed, or pending orders are not returned by this method and should be retrieved through the trading state snapshot
+          - positions of filled orders are not returned by this method and can be calculated based on deals with type = 'open', 'close'
+
+          Query rules:
+          - `from` is required when `cursor` is not provided
+          - `from` must be earlier than the current server time
+          - the requested history window must be within the configured history age
+          - the requested range length must not exceed the configured history range
+          - retrieve the current values from `GET /v1/configuration/accounts/{account_id}/limits`
+          - use either:
+            - 'from' + optional 'to'
+            - or 'cursor'
+            - 'to' must be later than 'from'
+            - 'cursor' cannot be combined with filters other than `limit`
+            - `limit` must be between 1 and 200
+            - returned orders are sorted in ascending order by `event_time`, from older to newer
+
+          Filtering:
+          - by order state: filled, cancelled, rejected
+          - by instrument
+
+          Response composition:
+          - each item contains exactly one historical order
+          - orders are returned only if their own `event_time` is within the requested range
+          - related objects outside the requested range are not expanded into the response
+
+          Runtime restrictions:
+          - unavailable if trade_mode is trading_disabled
+      x-runtime-restrictions:
+          - trading_disabled
+      operationId: getOrdersHistory
+      x-public-error-codes:
+          - REQUEST_INVALID
+          - REQUEST_INVALID_PARAMETERS
+          - REQUEST_INVALID_TIME_RANGE
+          - REQUEST_INVALID_LIMIT
+          - REQUEST_INVALID_CURSOR
+          - REQUEST_INVALID_FILTER_COMBINATION
+          - AUTH_INVALID_API_KEY
+          - AUTH_INVALID_SIGNATURE
+          - AUTH_PERMISSION_DENIED
+          - ACCOUNT_NOT_FOUND
+          - MARKET_INSTRUMENT_NOT_FOUND
+          - REQUEST_RATE_LIMIT
+          - SYSTEM_TEMPORARY_UNAVAILABLE
+          - SYSTEM_INTERNAL_ERROR
+      parameters:
+          - $ref: "#/components/parameters/AccountIdPath"
+          - name: from
+            in: query
+            required: false
+            description: Inclusive range start in UTC. Required when `cursor` is not provided. Must be earlier than the current server time.
+            schema:
+              type: string
+              format: date-time
+          - name: to
+            in: query
+            required: false
+            description: |
+              Exclusive range end in UTC.
+              Must be later than `from`.
+              The requested window must be within the configured history age.
+              The requested range must not exceed the configured history range.
+            schema:
+              type: string
+              format: date-time
+          - name: cursor
+            in: query
+            required: false
+            description: Opaque continuation token returned by the previous response page.
+            schema:
+              type: string
+          - name: limit
+            in: query
+            required: false
+            description: Maximum number of items to return. Default is 100. Must be between 1 and 200.
+            schema:
+              type: integer
+              default: 100
+              minimum: 1
+              maximum: 200
+          - name: order_state
+            in: query
+            required: false
+            description: |
+              Closed order state filter.
+
+              Applicable only to order history records.
+            schema:
+              type: string
+              enum:
+                - filled
+                - cancelled
+                - rejected
+          - $ref: "#/components/parameters/InstrumentFilter"
+      responses:
+        "200":
+          description: Orders history returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrdersHistoryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/history/accounts/{account_id}/deals:
+    get:
+      tags:
+        - Trading
+      summary: Get deals history
+      description: |
+          Returns historical deals within the configured history age and range limits.
+
+          Deals:
+          - all deal types may be returned
+          - deals do not have lifecycle statuses
+          - deals may represent both trading activity and balance operations
+          - deal-to-order relation is exposed through `deal.order_id`, when applicable
+
+          Supported deal types:
+          - open: position opening deal
+          - close: position closing deal
+          - balance: deposit or withdrawal
+          - null_compensation
+          - admin_fee
+          - swap_fee
+          - dividend
+          - exness_dollar
+
+          Query rules:
+          - `from` is required when `cursor` is not provided
+          - `from` must be earlier than the current server time
+          - the requested history window must be within the configured history age
+          - the requested range length must not exceed the configured history range
+          - retrieve the current values from `GET /v1/configuration/accounts/{account_id}/limits`
+          - use either:
+            - 'from' + optional 'to'
+            - or 'cursor'
+            - 'to' must be later than 'from'
+            - 'cursor' cannot be combined with filters other than `limit`
+            - `limit` must be between 1 and 200
+            - returned deals are sorted in ascending order by `event_time`, from older to newer
+
+          Filtering:
+          - by deal type: open, close, balance, null_compensation, admin_fee, swap_fee, dividend, exness_dollar
+          - by instrument
+
+          Response composition:
+          - each item contains exactly one historical deal
+          - deals are returned only if their own `event_time` is within the requested range
+          - related objects outside the requested range are not expanded into the response
+
+          Runtime restrictions:
+          - unavailable if trade_mode is trading_disabled
+      x-runtime-restrictions:
+          - trading_disabled
+      operationId: getDealsHistory
+      x-public-error-codes:
+          - REQUEST_INVALID
+          - REQUEST_INVALID_PARAMETERS
+          - REQUEST_INVALID_TIME_RANGE
+          - REQUEST_INVALID_LIMIT
+          - REQUEST_INVALID_CURSOR
+          - REQUEST_INVALID_FILTER_COMBINATION
+          - AUTH_INVALID_API_KEY
+          - AUTH_INVALID_SIGNATURE
+          - AUTH_PERMISSION_DENIED
+          - ACCOUNT_NOT_FOUND
+          - MARKET_INSTRUMENT_NOT_FOUND
+          - REQUEST_RATE_LIMIT
+          - SYSTEM_TEMPORARY_UNAVAILABLE
+          - SYSTEM_INTERNAL_ERROR
+      parameters:
+          - $ref: "#/components/parameters/AccountIdPath"
+          - name: from
+            in: query
+            required: false
+            description: Inclusive range start in UTC. Required when `cursor` is not provided. Must be earlier than the current server time.
+            schema:
+              type: string
+              format: date-time
+          - name: to
+            in: query
+            required: false
+            description: |
+              Exclusive range end in UTC.
+              Must be later than `from`.
+              The requested window must be within the configured history age.
+              The requested range must not exceed the configured history range.
+            schema:
+              type: string
+              format: date-time
+          - name: cursor
+            in: query
+            required: false
+            description: Opaque continuation token returned by the previous response page.
+            schema:
+              type: string
+          - name: limit
+            in: query
+            required: false
+            description: Maximum number of items to return. Default is 100. Must be between 1 and 200.
+            schema:
+              type: integer
+              default: 100
+              minimum: 1
+              maximum: 200
+          - name: deal_type
+            in: query
+            required: false
+            description: Deal type filter
+            schema:
+              type: string
+              enum:
+                - open
+                - close
+                - balance
+                - null_compensation
+                - admin_fee
+                - swap_fee
+                - dividend
+                - exness_dollar
+          - $ref: "#/components/parameters/InstrumentFilter"
+      responses:
+        "200":
+          description: Deals history returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DealsHistoryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+
+  /v1/server-events/accounts/{account_id}/ws/events:
+    post:
+      tags:
+        - Server Events
+      summary: Server events subscription
+      description: |
+        This OpenAPI operation models the WebSocket subscription command message.
+        The actual WebSocket connection handshake is signed as a `GET` request.
+        The signed `path` field in `EXN-DATA` must exactly match the WebSocket connection path:
+        `/v1/server-events/accounts/{account_id}/ws/events`.
+
+        Use this stream for:
+        - transactions
+        - account_state
+        - instruments
+        - hmr
+
+        Do not subscribe to `ticks` through this stream. Use `/v1/server-events/accounts/{account_id}/ws/ticks` for live ticks.
+
+        Server events subscription provides realtime updates about:
+        - finalized account and trading state changes
+        - rejected or failed processing results
+        - account state events
+        - HMR period snapshots and updates
+        - instrument updates
+
+        After successful subscription to `transactions`, the server sends `trading_state_snapshot` containing the current trading state of the account.
+
+        Subsequent finalized account and trading state changes are delivered through `transaction_event`.
+
+        A transaction event may represent:
+        - a trading transaction
+        - a non-trading balance transaction
+        - a rejected or failed processing result without changed trading entities
+
+        Trading transactions contain only entities that were created or changed as a result of the concrete transaction.
+        Examples:
+        - pending order placement may include one order and account_state
+        - pending order placement with SL/TP may include multiple changed orders, for example the main pending order and a related SLTP order, plus account_state
+        - market order execution may include order, deal, position and account_state
+        - partial position close is delivered as a transaction_event; the position remains open and its volume decreases
+        - position close may include order, deal, position and account_state
+
+        Trading snapshot may represent active SL/TP values directly on the related pending order, while transaction_event may include a separate SLTP order as one of the changed entities.
+
+        Non-trading balance transactions are also delivered as transaction events.
+        Examples:
+        - balance (deposit, withdrawal)
+        - null_compensation
+        - swap_fee
+        - admin_fee
+        - dividend
+        - exness_dollar
+
+        Such events may contain only a balance-type deal and account_state.
+        `operation_id` is omitted when absent, including for non-trading balance transactions.
+
+        Rejected or failed processing results are also delivered through `transaction_event`.
+        They may contain an empty payload when no trading entities were changed.
+        `status` values have the following meaning:
+        - `success` means a finalized account or trading state change was produced
+        - `rejected` means processing was rejected by validation or trading rules
+        - `failed` means processing failed
+
+        Subscription `account_state` delivers periodic account floating state updates.
+        In the current version, this subscription is intended for equity monitoring and sends `account_state_event` messages with:
+        - balance
+        - equity
+        - used_margin
+
+        These events represent account state recalculation, primarily equity / floating state changes. Balance-changing operations are not delivered through `account_state`.
+        The current standard delivery interval is 2 seconds.
+
+        Correlation fields:
+        - `operation_id` identifies the concrete operation or platform-generated event operation and is placed at the event envelope level
+
+        Standalone periodic account state events are delivered through `account_state_event`.
+
+        Subscription `hmr` delivers High Margin Requirement events through this same server events stream.
+        The client must supply an explicit list of `instruments` to receive HMR period events for.
+        HMR events are delivered without the generic `payload` wrapper.
+        For `hmr_snapshot`, `periods` is placed at the event top level.
+        For `hmr_update`, `upserted_periods` and `removed_period_ids` are placed at the event top level.
+        HMR events do not include `event_time` in the current version.
+        After a successful `hmr` subscription, the server sends an `hmr_snapshot` message containing the full
+        active and scheduled future HMR period state applicable to the selected account in `periods`. This snapshot is a
+        recalculation of the client-applicable HMR conditions at the time it is produced; it is not a list of
+        changed fields. Each period reports the concrete `instruments` it affects.
+
+        Subscription rules:
+        - the client must provide one or more instruments; there is no `all` wildcard for `hmr`
+        - each requested instrument must be available for the selected account
+        - the list of instruments available for subscription can be retrieved using
+          `GET /v1/configuration/accounts/{account_id}/instruments`
+        - if at least one requested instrument is not available for the account, the entire `hmr`
+          subscription request is rejected; existing subscriptions are not affected
+
+        The server may send a new `hmr_snapshot` during an active subscription only when the account's effective
+        flexible HMR status changes.
+        Clients should replace their local HMR period state with the latest snapshot.
+
+        New or updated HMR periods and removed HMR periods are delivered as incremental `hmr_update` messages
+        while the `hmr` subscription is active. Clients should apply incremental updates on top of the latest
+        HMR period snapshot and treat any subsequent `hmr_snapshot` as the new full baseline.
+
+        To stop receiving HMR period updates, send an `unsubscribe` request with `event: hmr` and the instrument
+        list to remove from the active subscription.
+
+        Subscription `instruments` delivers realtime instrument condition updates.
+
+        After successful subscription, the client receives `instrument_event` messages only for instruments
+        included in the subscription request.
+
+        Subscription rules:
+        - the client may subscribe to one or more instruments; use `["all"]` to subscribe to all instruments
+          available for the selected account
+        - each requested instrument must be available for the selected account
+        - the list of instruments available for subscription can be retrieved using
+          `GET /v1/configuration/accounts/{account_id}/instruments`
+        - if at least one requested instrument is not available for the account, the entire subscription
+          request is rejected; existing subscriptions are not affected
+
+        Instrument update semantics:
+        - an `instrument_event` is sent when an instrument is created, updated, or deleted in the
+          configuration; `action` indicates the lifecycle stage: `new`, `upd`, or `del`
+        - the event contains the full current instrument condition object, not only changed fields;
+          the payload schema matches `InstrumentConditionResponse`
+        - events are account-scoped: the payload is resolved for the selected account and may differ
+          between accounts
+        - events are delivered only for instruments selected in the subscription request
+
+        To stop receiving instrument updates, send an `unsubscribe` request with `event: instruments`
+        and the instrument list to remove from the active subscription. Use `["all"]` to unsubscribe
+        from all instrument updates.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+
+        Recovery guarantees and limits:
+        - The WebSocket connection is not a durable event log. The server does not support replaying missed
+          events, resuming a previous connection, or requesting gap-fill by `id`, `operation_id`, or timestamp.
+        - Events are delivered only while the connection is alive and the corresponding subscription is active.
+          Events produced while the client is disconnected or not subscribed may be missed.
+        - If the per-connection send buffer overflows, for example because the client reads too slowly, the server
+          may close the WebSocket connection; missed messages from that connection are not replayed.
+        - On reconnect, the client must open a new WebSocket connection, send subscribe requests again, and treat
+          the new `trading_state_snapshot` as the baseline for current state.
+        - The snapshot contains current open orders, open positions, and account state. It does not reconstruct
+          every missed `transaction_event`; use Trading History to reconcile historical orders and deals when needed.
+        - If a REST ACK was received but the expected `operation_id` is not observed in Server Events, poll
+          `GET /v1/trading/accounts/{account_id}/operations/{operation_id}` while operation status is retained,
+          then reconcile current state using the trading snapshot.
+        - If the client receives an unknown `operation_id` or cannot prove event continuity after reconnect,
+          it should resubscribe and reconcile from snapshots instead of assuming that no events were missed.
+      x-runtime-restrictions:
+        - trading_disabled
+      operationId: getWSEvents
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      x-public-async-error-codes:
+        - ACCOUNT_NOT_FOUND
+        - ACCOUNT_DISABLED
+        - ACCOUNT_CLOSE_ONLY
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - REQUEST_INVALID_PRICE
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_TRADE_DISABLED
+        - MARKET_CLOSE_ONLY
+        - MARKET_SESSION_CLOSED
+        - MARKET_NO_QUOTES
+        - TRADING_RULE_INVALID_VOLUME
+        - TRADING_RULE_VOLUME_TOO_SMALL
+        - TRADING_RULE_VOLUME_TOO_LARGE
+        - TRADING_RULE_INVALID_VOLUME_STEP
+        - TRADING_RULE_INVALID_REMAINING_VOLUME
+        - TRADING_RULE_INVALID_PRICE_LEVELS
+        - TRADING_RULE_INSUFFICIENT_MARGIN
+        - TRADING_RULE_MARGIN_LEVEL_TOO_LOW
+        - TRADING_RULE_OPERATION_RESTRICTED
+        - TRADING_RULE_TOO_MANY_PENDING_ORDERS
+        - TRADING_RULE_TOO_MANY_OPEN_POSITIONS
+        - EXECUTION_REQUOTE
+        - EXECUTION_REJECTED
+        - SYSTEM_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WSEventsCommandRequestData"
+            examples:
+              transactions:
+                summary: Subscribe to transaction events
+                value:
+                  id: "request-789"
+                  subscribe:
+                    event: transactions
+              accountOverview:
+                summary: Subscribe to periodic account state events
+                value:
+                  id: "request-791"
+                  subscribe:
+                    event: account_state
+              hmr:
+                summary: Subscribe to HMR period events
+                value:
+                  id: "request-796"
+                  subscribe:
+                    event: hmr
+                    instruments:
+                      - EURUSD
+                      - XAUUSD
+              selectedInstrumentsOverview:
+                summary: Subscribe to selected instrument updates
+                value:
+                  id: "request-792"
+                  subscribe:
+                    event: instruments
+                    instruments:
+                      - EURUSD
+                      - GBPUSD
+              allInstrumentsOverview:
+                summary: Subscribe to all instrument updates
+                value:
+                  id: "request-793"
+                  subscribe:
+                    event: instruments
+                    instruments:
+                      - all
+              selectedInstrumentsUnsubscribe:
+                summary: Unsubscribe from selected instrument updates
+                value:
+                  id: "request-794"
+                  unsubscribe:
+                    event: instruments
+                    instruments:
+                      - EURUSD
+                      - GBPUSD
+              allInstrumentsUnsubscribe:
+                summary: Unsubscribe from all instrument updates
+                value:
+                  id: "request-795"
+                  unsubscribe:
+                    event: instruments
+                    instruments:
+                      - all
+              hmrUnsubscribe:
+                summary: Unsubscribe from HMR period events
+                value:
+                  id: "request-797"
+                  unsubscribe:
+                    event: hmr
+                    instruments:
+                      - EURUSD
+                      - XAUUSD
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WSTradingEvent"
+              examples:
+                tradingStateSnapshot:
+                  summary: Initial trading state snapshot
+                  value:
+                    event_type: trading_state_snapshot
+                    payload:
+                      orders:
+                        - order_id: "1001"
+                          order_type: limit
+                          state: placed
+                          direction: buy
+                          instrument: EURUSD
+                          price: "1.0800"
+                          volume: "1.0"
+                          stop_loss_price: "1.0750"
+                          take_profit_price: "1.0900"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                      positions:
+                        - position_id: "2001"
+                          direction: buy
+                          instrument: EURUSD
+                          initial_volume: "1.0"
+                          volume: "1.0"
+                          open_price: "1.0834"
+                          state: open
+                          margin_rate: "0"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                          commission: "0"
+                          swap: "0"
+                      account_state:
+                        balance: "10000.00"
+                        equity: "10020.00"
+                        used_margin: "100.00"
+                        leverage: "100"
+                tradingTransactionEvent:
+                  summary: Trading transaction event
+                  value:
+                    event_type: transaction_event
+                    operation_id: "789"
+                    status: success
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    payload:
+                      orders:
+                        - order_id: "1001"
+                          position_id: "2001"
+                          order_type: market
+                          state: filled
+                          direction: buy
+                          instrument: EURUSD
+                          price: "1.0834"
+                          volume: "1.0"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                      positions:
+                        - position_id: "2001"
+                          direction: buy
+                          instrument: EURUSD
+                          initial_volume: "1.0"
+                          volume: "1.0"
+                          open_price: "1.0834"
+                          state: open
+                          create_time: "2026-12-14T11:46:30+00:00"
+                      deals:
+                        - deal_id: "3001"
+                          position_id: "2001"
+                          type: open
+                          direction: buy
+                          instrument: EURUSD
+                          volume: "1.0"
+                          price: "1.0834"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                      account_state:
+                        balance: "10000.00"
+                        equity: "10020.00"
+                        used_margin: "100.00"
+                        leverage: "100"
+                pendingOrderPlacementTransactionEvent:
+                  summary: Pending order placement with SLTP
+                  value:
+                    event_type: transaction_event
+                    operation_id: "790"
+                    status: success
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    payload:
+                      orders:
+                        - order_id: "1001"
+                          order_type: limit
+                          state: placed
+                          direction: buy
+                          instrument: EURUSD
+                          price: "1.0800"
+                          stop_loss_price: "1.0750"
+                          take_profit_price: "1.0900"
+                          volume: "1.0"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                        - order_id: "1002"
+                          order_type: sltp
+                          state: placed
+                          stop_loss_price: "1.0750"
+                          take_profit_price: "1.0900"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                      account_state:
+                        balance: "10000.00"
+                        equity: "10020.00"
+                        used_margin: "100.00"
+                        leverage: "100"
+                sltpTransactionEvent:
+                  summary: SLTP order placement
+                  value:
+                    event_type: transaction_event
+                    operation_id: "868"
+                    status: success
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    payload:
+                      orders:
+                        - order_id: "1001"
+                          position_id: "1"
+                          order_type: sltp
+                          state: placed
+                          stop_loss_price: "1.0750"
+                          take_profit_price: "1.0900"
+                          create_time: "2026-12-14T11:46:30+00:00"
+                balanceTransactionEvent:
+                  summary: Non-trading balance transaction event
+                  value:
+                    event_type: transaction_event
+                    status: success
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    payload:
+                      deals:
+                        - deal_id: "3002"
+                          type: balance
+                          profit:
+                            amount: "500"
+                            currency: USD
+                          create_time: "2026-12-14T11:46:30+00:00"
+                      account_state:
+                        balance: "10500.00"
+                        equity: "10520.00"
+                        used_margin: "100.00"
+                        leverage: "100"
+                accountOverviewEvent:
+                  summary: Periodic account state event
+                  value:
+                    event_type: account_state_event
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    payload:
+                      account_state:
+                        balance: "10000.00"
+                        equity: "10018.00"
+                        used_margin: "100.00"
+                instrumentEvent:
+                  summary: Instrument update event
+                  value:
+                    event_type: instrument_event
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    action: upd
+                    payload:
+                      instrument: EURUSD
+                      description: Euro vs US Dollar
+                      international_name: EUR/USD
+                      category: Forex
+                      base_currency: EUR
+                      quote_currency: USD
+                      margin_currency: EUR
+                      point_digits: 5
+                      exec_mode: market
+                      calc_mode: forex
+                      margin_percent: "1"
+                      contract_size: "100000"
+                      volume_min: "0.01"
+                      volume_max: "200"
+                      volume_step: "0.01"
+                      swap_long: "-6.35"
+                      swap_short: "2.14"
+                      trade_mode: enabled
+                      order_types:
+                        - limit
+                        - market
+                      filling_modes:
+                        - fok
+                      trade_sessions:
+                        - trade_mode: enabled
+                          week_start_time: "Mon, 00:00:00"
+                          week_end_time: "Fri, 23:59:59"
+                      commission_settings:
+                        commission_type: per_lot_per_trade
+                        commission_value:
+                          amount: "0"
+                          currency: USD
+                hmrSnapshot:
+                  summary: Active and future HMR period snapshot after HMR subscription or after the trader effective HMR conditions change
+                  value:
+                    event_type: hmr_snapshot
+                    periods:
+                      - period_id: "701"
+                        event_type: regular
+                        instruments:
+                          - EURUSD
+                          - EURGBP
+                        leverage: "10"
+                        start_time: "2026-12-14 11:00:00"
+                        end_time: "2026-12-14 12:00:00"
+                      - period_id: "702"
+                        event_type: periodic
+                        instruments:
+                          - XAUUSD
+                        leverage: "20"
+                        start_time: "Mon, 13:00:00"
+                        end_time: "Mon, 14:00:00"
+                hmrUpdate:
+                  summary: Incremental HMR period update
+                  value:
+                    event_type: hmr_update
+                    upserted_periods:
+                      - period_id: "703"
+                        event_type: regular
+                        instruments:
+                          - XAUUSD
+                        leverage: "20"
+                        start_time: "2026-12-14 13:00:00"
+                        end_time: "2026-12-14 14:00:00"
+                    removed_period_ids:
+                      - "701"
+                rejectedProcessingResultEvent:
+                  summary: Rejected processing result event
+                  value:
+                    event_type: transaction_event
+                    operation_id: "789"
+                    status: rejected
+                    error_code: 5006
+                    error_message: TRADING_RULE_INSUFFICIENT_MARGIN
+                    event_time: "2026-12-14T11:46:30+00:00"
+                    payload: {}
+        "400":
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WsErrorResponse"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/server-events/accounts/{account_id}/ws/ticks:
+    post:
+      tags:
+        - Server Events
+      summary: Ticks subscription
+      description: |
+        This OpenAPI operation models the WebSocket subscription command message.
+        The actual WebSocket connection handshake is signed as a `GET` request.
+        The signed `path` field in `EXN-DATA` must exactly match the WebSocket connection path:
+        `/v1/server-events/accounts/{account_id}/ws/ticks`.
+
+        Use this stream only for live ticks.
+        Do not subscribe to `transactions`, `account_state`, `instruments`, or `hmr` through this stream.
+
+        Ticks subscription provides realtime Bid/Ask prices for subscribed instruments.
+        Initial state:
+          - Upon successful subscription, the server sends the last tick for each subscribed instrument.
+
+        In order to ensure system stability and performance, tick updates may be throttled. The delivery frequency may be reduced up to one update per 500ms.
+
+        Runtime restrictions:
+        - unavailable if trade_mode is trading_disabled
+      x-runtime-restrictions:
+        - trading_disabled
+      operationId: getWSTicks
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - MARKET_NO_QUOTES
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WSTicksSubscribeRequestData"
+            examples:
+              ticksXauusd:
+               summary: Subscribe to XAUUSD ticks
+               value:
+                id: "ticks-xauusd-1"
+                subscribe:
+                  event: ticks
+                  instruments:
+                    - XAUUSD
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WSTick"
+        "400":
+          description: |
+            Bad Request
+
+            Possible reasons:
+            - bad request
+            - trading disabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WsErrorResponse"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/configuration/accounts/{account_id}/account:
+    get:
+      tags:
+        - Configuration
+      summary: Get account info
+      description: |
+        Returns account information and settings.
+
+        `trade_mode` and `account_status` are independent fields.
+        Any combination of these fields is valid.
+
+        Examples:
+        - `trade_mode=trading_disabled` with `account_status=active`
+        - `trade_mode=enabled` with `account_status=close_only`
+      operationId: getAccountDetails
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountDetailsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/configuration/accounts/{account_id}/instruments:
+    get:
+      tags:
+        - Configuration
+      summary: Get available instrument list
+      description: |
+        Returns only names of instruments available for the selected account.
+
+      operationId: getAvailableInstrumentList
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentNameListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/configuration/accounts/{account_id}/instruments/{instrument}/conditions:
+    get:
+      tags:
+        - Configuration
+      summary: Get instrument condition
+      description: |
+        Returns trading conditions, trading sessions and commission settings
+        for one selected instrument.
+
+        This response is the source of per-instrument trading validation inputs used by mutating trading methods:
+        - `volume_min`, `volume_max`, `volume_step` for volume validation
+        - `point_digits` for price precision and implied price step `10^-point_digits`
+
+      operationId: getInstrumentCondition
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - REQUEST_INVALID_PARAMETERS
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - MARKET_INSTRUMENT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+        - name: instrument
+          in: path
+          required: true
+          description: Instrument symbolic identifier
+          schema:
+            $ref: "#/components/schemas/InstrumentName"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentConditionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/configuration/accounts/{account_id}/limits:
+    get:
+      tags:
+        - Configuration
+      summary: Get API limits
+      description: |
+        Returns the effective REST and WebSocket limits for the account. REST limits are reported
+        for the whole AP cluster; WebSocket limits are enforced per server node.
+      operationId: getLimits
+      x-public-error-codes:
+        - REQUEST_INVALID
+        - AUTH_INVALID_API_KEY
+        - AUTH_INVALID_SIGNATURE
+        - AUTH_PERMISSION_DENIED
+        - ACCOUNT_NOT_FOUND
+        - REQUEST_RATE_LIMIT
+        - SYSTEM_TEMPORARY_UNAVAILABLE
+        - SYSTEM_INTERNAL_ERROR
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LimitsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthorizationFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/AccountNotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+components:
+  securitySchemes:
+    ExnApiKeyAuth:
+      type: apiKey
+      in: header
+      name: EXN-API-KEY
+      description: |
+        Public API key identifier used by signed requests.
+
+        This value must match the `api_key` field inside the signed `EXN-DATA` payload.
+        Unknown, expired, or mismatched API keys are returned as `AUTH_INVALID_API_KEY`.
+
+    ExnTimestampAuth:
+      type: apiKey
+      in: header
+      name: EXN-TIMESTAMP
+      description: |
+        Unix timestamp in milliseconds used by signed requests.
+
+        This value must match the `timestamp` field inside the signed `EXN-DATA` payload.
+        Clients should generate a fresh timestamp and signature for every request.
+        Requests outside the accepted server time window are rejected.
+
+    ExnDataAuth:
+      type: apiKey
+      in: header
+      name: EXN-DATA
+      description: |
+        Base64url-encoded signed data payload, without `=` padding.
+
+        The decoded payload is a JSON object with the following fields:
+        - `api_key`: same value as `EXN-API-KEY`
+        - `idempotency_key`: same value as `EXN-IDEMPOTENCY-KEY`; empty string for signed `GET` requests
+        - `timestamp`: same value as `EXN-TIMESTAMP`
+        - `sign_version`: same value as `EXN-SIGN-VERSION`
+        - `method`: uppercase HTTP method, for example `POST`
+        - `path`: request path with query string exactly as sent by the client
+        - `body_hash`: SHA-256 hash of the request body, base64url-encoded without padding
+
+        Example decoded payload:
+        ```json
+        {
+          "api_key": "exnsk-live-example",
+          "idempotency_key": "order-20260316-0001",
+          "timestamp": 1773656070123,
+          "sign_version": 1,
+          "method": "POST",
+          "path": "/v1/trading/accounts/123456789/orders",
+          "body_hash": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+        }
+        ```
+
+    ExnSignatureAuth:
+      type: apiKey
+      in: header
+      name: EXN-SIGN
+      description: |
+        Ed25519 signature for the decoded `EXN-DATA` payload, encoded as base64url without `=` padding.
+
+        Invalid signatures are returned as `AUTH_INVALID_SIGNATURE`.
+
+    ExnSignVersionAuth:
+      type: apiKey
+      in: header
+      name: EXN-SIGN-VERSION
+      description: |
+        Signature protocol version.
+
+        The only supported value is `1`. This value must match the `sign_version` field inside `EXN-DATA`.
+
+    ExnIdempotencyKeyAuth:
+      type: apiKey
+      in: header
+      name: EXN-IDEMPOTENCY-KEY
+      description: |
+        Idempotency and correlation key for signed requests.
+
+        For mutating requests, this header is required and must contain a 5..128 character key.
+        For signed `GET` requests, this header is still required by the signature protocol,
+        but its value must be empty.
+        This value must match the `idempotency_key` field inside `EXN-DATA`.
+
+        Allowed characters for non-empty keys are `A-Z`, `a-z`, `0-9`, `.`, `_`, `-`, `~`.
+
+  parameters:
+    AccountIdPath:
+      name: account_id
+      in: path
+      required: true
+      description: Trading account number (associated with API key)
+      schema:
+        $ref: "#/components/schemas/UInt64String"
+
+    ExnIdempotencyKey:
+      name: EXN-IDEMPOTENCY-KEY
+      in: header
+      required: true
+      description: |
+        Idempotency and correlation key for signed requests.
+
+        For mutating requests, this header is required and must contain a 5..128 character key.
+        For signed `GET` requests, this header is still required by the signature protocol,
+        but its value must be empty.
+        This value must match the `idempotency_key` field inside `EXN-DATA`.
+      schema:
+        oneOf:
+          - type: string
+            const: ""
+            description: Required empty value for signed GET requests.
+          - type: string
+            minLength: 5
+            maxLength: 128
+            pattern: '^[A-Za-z0-9._~-]{5,128}$'
+            description: Required non-empty value for signed mutating requests.
+
+    InstrumentFilter:
+      name: instrument
+      in: query
+      required: false
+      description: Instrument symbolic identifier filter
+      schema:
+        $ref: "#/components/schemas/InstrumentName"
+
+  responses:
+    BadRequest:
+      description: |
+        Bad Request.
+
+        Possible public error codes include:
+        - `REQUEST_INVALID`
+        - `REQUEST_INVALID_PARAMETERS`
+        - `REQUEST_INVALID_PRICE`
+        - `REQUEST_INVALID_TIMEFRAME`
+        - `REQUEST_INVALID_TIME_RANGE`
+        - `REQUEST_INVALID_COUNT`
+        - `REQUEST_INVALID_LIMIT`
+        - `REQUEST_INVALID_CURSOR`
+        - `REQUEST_INVALID_PRICE_TYPE`
+        - `REQUEST_INVALID_FILTER_COMBINATION`
+        - `REQUEST_UNSUPPORTED_MEDIA_TYPE`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            request_invalid:
+              value:
+                code: 3000
+                error_message: REQUEST_INVALID
+            request_invalid_parameters:
+              value:
+                code: 3001
+                error_message: REQUEST_INVALID_PARAMETERS
+            request_invalid_price:
+              value:
+                code: 3002
+                error_message: REQUEST_INVALID_PRICE
+            request_unsupported_media_type:
+              value:
+                code: 3010
+                error_message: REQUEST_UNSUPPORTED_MEDIA_TYPE
+
+    AuthorizationFailed:
+      description: |
+        Authentication failed.
+
+        Possible public error codes include:
+        - `AUTH_INVALID_API_KEY`
+        - `AUTH_INVALID_SIGNATURE`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalid_api_key:
+              value:
+                code: 1000
+                error_message: AUTH_INVALID_API_KEY
+            invalid_signature:
+              value:
+                code: 1001
+                error_message: AUTH_INVALID_SIGNATURE
+
+    Forbidden:
+      description: |
+        Operation is not permitted for the authenticated API key, account, source IP,
+        or operation scope.
+
+        Possible public error codes include:
+        - `AUTH_PERMISSION_DENIED`
+        - `ACCOUNT_DISABLED`
+        - `ACCOUNT_CLOSE_ONLY`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            permission_denied:
+              value:
+                code: 1002
+                error_message: AUTH_PERMISSION_DENIED
+            account_disabled:
+              value:
+                code: 2001
+                error_message: ACCOUNT_DISABLED
+            account_close_only:
+              value:
+                code: 2002
+                error_message: ACCOUNT_CLOSE_ONLY
+
+    AccountNotFound:
+      description: Account not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            account_not_found:
+              value:
+                code: 2000
+                error_message: ACCOUNT_NOT_FOUND
+
+    Conflict:
+      description: |
+        State conflict or execution conflict.
+
+        Possible public error codes include:
+        - `MARKET_SESSION_CLOSED`
+        - `EXECUTION_REQUOTE`
+        - `EXECUTION_REJECTED`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            market_session_closed:
+              value:
+                code: 4003
+                error_message: MARKET_SESSION_CLOSED
+            execution_requote:
+              value:
+                code: 6000
+                error_message: EXECUTION_REQUOTE
+            execution_rejected:
+              value:
+                code: 6001
+                error_message: EXECUTION_REJECTED
+
+    UnprocessableEntity:
+      description: |
+        Business validation failed.
+
+        Possible public error codes include `TRADING_RULE_*` errors.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalid_volume:
+              value:
+                code: 5000
+                error_message: TRADING_RULE_INVALID_VOLUME
+            insufficient_margin:
+              value:
+                code: 5006
+                error_message: TRADING_RULE_INSUFFICIENT_MARGIN
+
+    TooManyRequests:
+      description: |
+        Public API endpoint quota exceeded.
+
+        `REQUEST_RATE_LIMIT` is non-retryable automatically. Clients should use
+        `GET /v1/configuration/accounts/{account_id}/limits` and local request accounting
+        to calculate remaining quota before sending more requests.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            request_rate_limit:
+              value:
+                code: 3015
+                error_message: REQUEST_RATE_LIMIT
+
+    ServiceUnavailable:
+      description: |
+        Service temporarily unavailable.
+
+        Possible public error codes include:
+        - `SYSTEM_TEMPORARY_UNAVAILABLE`
+        - `MARKET_NO_QUOTES`
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            temporary_unavailable:
+              value:
+                code: 2
+                error_message: SYSTEM_TEMPORARY_UNAVAILABLE
+            no_quotes:
+              value:
+                code: 4004
+                error_message: MARKET_NO_QUOTES
+
+    InternalServerError:
+      description: |
+        Internal Server Error
+
+        The server encountered an unexpected condition that prevented it from fulfilling the request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            internal_error:
+              value:
+                code: 3
+                error_message: SYSTEM_INTERNAL_ERROR
+
+  schemas:
+    # ------------------------------------------------------------------
+    # Common / shared schemas
+    # ------------------------------------------------------------------
+
+    ErrorResponse:
+      type: object
+      description: |
+        Public API business error response.
+
+        `code` is the primary signal for client automation. Public errors are non-retryable by default.
+
+        Rate-limit code semantics:
+        - `REQUEST_RATE_LIMIT` is returned for Public API endpoint and tier quota limits.
+          It is a synchronous REST `429` error and is non-retryable automatically.
+          Clients should use the limits endpoint and local request accounting to calculate remaining quota.
+        - `SYSTEM_RATE_LIMIT` is reserved for trading platform throttling mapped from internal
+          `ResultTooManyRequests`. It is not used for Public API endpoint quotas and may appear as a final
+          asynchronous trading operation error.
+      required:
+        - code
+        - error_message
+      properties:
+        code:
+          $ref: "#/components/schemas/PublicApiErrorCode"
+        error_message:
+          type: string
+          description: Stable public error message in `<CATEGORY>_<REASON>` format.
+
+    PublicApiErrorCode:
+      type: integer
+      format: int32
+      description: |
+        Stable public business error code. HTTP status describes the transport/API layer;
+        this code is the primary business signal for client automation.
+
+        Public codes currently returned by this API:
+        - 1: SYSTEM_RATE_LIMIT
+        - 2: SYSTEM_TEMPORARY_UNAVAILABLE
+        - 3: SYSTEM_INTERNAL_ERROR
+        - 1000: AUTH_INVALID_API_KEY
+        - 1001: AUTH_INVALID_SIGNATURE
+        - 1002: AUTH_PERMISSION_DENIED
+        - 2000: ACCOUNT_NOT_FOUND
+        - 2001: ACCOUNT_DISABLED
+        - 2002: ACCOUNT_CLOSE_ONLY
+        - 3000: REQUEST_INVALID
+        - 3001: REQUEST_INVALID_PARAMETERS
+        - 3002: REQUEST_INVALID_PRICE
+        - 3003: REQUEST_INVALID_TIMEFRAME
+        - 3004: REQUEST_INVALID_TIME_RANGE
+        - 3005: REQUEST_INVALID_COUNT
+        - 3006: REQUEST_INVALID_LIMIT
+        - 3007: REQUEST_INVALID_CURSOR
+        - 3008: REQUEST_INVALID_PRICE_TYPE
+        - 3009: REQUEST_INVALID_FILTER_COMBINATION
+        - 3010: REQUEST_UNSUPPORTED_MEDIA_TYPE
+        - 3011: REQUEST_METHOD_NOT_ALLOWED
+        - 3012: REQUEST_ORDER_NOT_FOUND
+        - 3013: REQUEST_POSITION_NOT_FOUND
+        - 3014: REQUEST_OPERATION_NOT_FOUND
+        - 3015: REQUEST_RATE_LIMIT
+        - 4000: MARKET_INSTRUMENT_NOT_FOUND
+        - 4001: MARKET_TRADE_DISABLED
+        - 4002: MARKET_CLOSE_ONLY
+        - 4003: MARKET_SESSION_CLOSED
+        - 4004: MARKET_NO_QUOTES
+        - 5000: TRADING_RULE_INVALID_VOLUME
+        - 5001: TRADING_RULE_VOLUME_TOO_SMALL
+        - 5002: TRADING_RULE_VOLUME_TOO_LARGE
+        - 5003: TRADING_RULE_INVALID_VOLUME_STEP
+        - 5004: TRADING_RULE_INVALID_REMAINING_VOLUME
+        - 5005: TRADING_RULE_INVALID_PRICE_LEVELS
+        - 5006: TRADING_RULE_INSUFFICIENT_MARGIN
+        - 5007: TRADING_RULE_MARGIN_LEVEL_TOO_LOW
+        - 5008: TRADING_RULE_OPERATION_RESTRICTED
+        - 5009: TRADING_RULE_TOO_MANY_PENDING_ORDERS
+        - 5010: TRADING_RULE_TOO_MANY_OPEN_POSITIONS
+        - 6000: EXECUTION_REQUOTE
+        - 6001: EXECUTION_REJECTED
+      enum:
+        - 1
+        - 2
+        - 3
+        - 1000
+        - 1001
+        - 1002
+        - 2000
+        - 2001
+        - 2002
+        - 3000
+        - 3001
+        - 3002
+        - 3003
+        - 3004
+        - 3005
+        - 3006
+        - 3007
+        - 3008
+        - 3009
+        - 3010
+        - 3011
+        - 3012
+        - 3013
+        - 3014
+        - 3015
+        - 4000
+        - 4001
+        - 4002
+        - 4003
+        - 4004
+        - 5000
+        - 5001
+        - 5002
+        - 5003
+        - 5004
+        - 5005
+        - 5006
+        - 5007
+        - 5008
+        - 5009
+        - 5010
+        - 6000
+        - 6001
+
+    WsErrorResponse:
+      type: object
+      description: WebSocket error response.
+      required:
+        - id
+        - code
+        - error_message
+      properties:
+        id:
+          type: string
+          description: Client request identifier
+          example: "a95b3221-7392-4766-b71e-95318c7580f1"
+        code:
+          $ref: "#/components/schemas/PublicApiErrorCode"
+        error_message:
+          type: string
+          description: Stable public error message in `<CATEGORY>_<REASON>` format.
+
+    Money:
+      type: object
+      description: Monetary value.
+      properties:
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+          description: Monetary amount represented as a decimal string.
+          example: "3.50"
+        currency:
+          type: string
+          example: USD
+          description: Currency code (e.g., USD, EUR)
+
+    DecimalString:
+      type: string
+      description: |
+       Decimal numeric value represented as a string to avoid precision loss.
+       The value must contain a valid decimal number in plain dot notation without thousand separators or scientific notation.
+      pattern: '^[+-]?[0-9]+(?:\.[0-9]+)?$'
+      example: "1.08340"
+
+    UInt64String:
+      type: string
+      description: |
+        Unsigned 64-bit integer value serialized as a decimal string.
+        The value must contain from 1 to 20 decimal digits and must not include a sign or separators.
+      minLength: 1
+      maxLength: 20
+      pattern: '^[0-9]{1,20}$'
+      example: "152706877"
+
+    InstrumentName:
+      type: string
+      description: Instrument symbolic identifier.
+      minLength: 1
+      maxLength: 11
+      pattern: '^[A-Za-z0-9._-]+$'
+      example: "EURUSD"
+
+    PositiveDecimalString:
+      type: string
+      description: |
+        Positive decimal numeric value represented as a string to avoid precision loss.
+        The value must contain a valid decimal number in plain dot notation without thousand separators or scientific notation.
+        Zero values such as `0`, `0.0`, and `0.00` are not allowed.
+      pattern: '^[+]?(?:(?:0*[1-9][0-9]*)(?:\.[0-9]+)?|0+\.[0-9]*[1-9][0-9]*)$'
+      example: "0.01"
+
+    ClosePositionVolumeString:
+      type: string
+      description: |
+        Decimal close volume represented as a string to avoid precision loss.
+        The value must contain a valid decimal number in plain dot notation without thousand separators or scientific notation.
+        Zero values such as `0`, `0.0`, and `0.00` are allowed only when `close_by_position_id` is provided.
+      pattern: '^[+]?[0-9]+(?:\.[0-9]+)?$'
+      example: "0.01"
+
+    InstrumentVolumeString:
+      allOf:
+        - $ref: "#/components/schemas/PositiveDecimalString"
+      description: |
+        Decimal trading volume represented as a string.
+        Instrument-specific validation inputs are provided by `GET /v1/configuration/accounts/{account_id}/instruments/{instrument}/conditions`:
+        - minimum volume: `volume_min`
+        - maximum volume: `volume_max`
+        - step: `volume_step`
+
+        For new positions and new pending orders, the requested value must satisfy:
+        - `volume > 0`
+        - `volume >= volume_min`
+        - `volume <= volume_max`
+        - `(volume - volume_min)` must be a multiple of `volume_step`
+      example: "0.01"
+
+    InstrumentPriceString:
+      allOf:
+        - $ref: "#/components/schemas/PositiveDecimalString"
+      description: |
+        Decimal instrument price represented as a string.
+        Instrument-specific precision is provided by `GET /v1/configuration/accounts/{account_id}/instruments/{instrument}/conditions`:
+        - `price > 0`
+        - maximum fractional digits: `point_digits`
+        - implied minimum price increment: `10^-point_digits`
+
+        Request price values must not contain more fractional digits than `point_digits`.
+        Additional business rules such as stop levels, execution mode, and market-side checks may also apply.
+      example: "1.08340"
+
+    # ------------------------------------------------------------------
+    # Reference enums
+    # ------------------------------------------------------------------
+
+    TradingSubscriptionType:
+      type: string
+      enum:
+        - transactions
+        - account_state
+        - instruments
+
+    TradingEventType:
+      type: string
+      enum:
+        - trading_state_snapshot
+        - transaction_event
+        - account_state_event
+        - instrument_event
+
+    InstrumentEventAction:
+      type: string
+      description: >
+        Lifecycle action derived from instrument configuration changes. This is a
+        transport-level marker: `new` for newly added instrument configuration,
+        `upd` for changed configuration, and `del` for removed configuration.
+      enum:
+        - new
+        - upd
+        - del
+
+    TradingEventStatus:
+      type: string
+      description: |
+        Public status of a transaction event.
+
+        `success` means a finalized account or trading state change was produced.
+        `rejected` and `failed` describe unsuccessful processing result.
+      enum:
+        - success
+        - failed
+        - rejected
+
+    AccountTradingStatus:
+      type: string
+      description: |
+        Restrictions on actions related to trading entities
+        Values:
+        - active: opening, modifying and closing trades is allowed
+        - close_only: only closing positions and cancelling orders is allowed
+      enum:
+        - active
+        - close_only
+
+    ExecutionMode:
+      type: string
+      description: Order execution mode.
+      enum:
+        - undefined
+        - instant
+        - market
+
+    CalculationMode:
+      type: string
+      enum:
+        - undefined
+        - forex
+        - forex_no_leverage
+        - cfd
+        - cfd_leverage
+
+    TradeMode:
+      type: string
+      description: |
+       Account status for trading
+       Values:
+       - enabled: the account is available for trading
+       - trading_disabled: trading operations and trading-related realtime streams are disabled; configuration remains available.
+      enum:
+        - enabled
+        - trading_disabled
+
+    InstrumentOrderType:
+      type: string
+      enum:
+        - stop
+        - limit
+        - stoplimit
+        - market
+
+    FillingMode:
+      type: string
+      enum:
+        - fok
+        - ioc
+        - boc
+
+    CommissionType:
+      type: string
+      enum:
+        - undefined
+        - per_lot_per_side
+        - per_lot_per_trade
+        - per_million_usd
+
+    OrderReason:
+      type: string
+      description: |
+       Technical platform reason code
+      enum:
+        - undefined
+        - sl
+        - tp
+        - so
+        - margin_check_failed
+        - dealer
+        - close_by
+        - stock_split
+        - trading_server
+
+    # ------------------------------------------------------------------
+    # Market data schemas (Candles/Ticks)
+    # ------------------------------------------------------------------
+
+    Candle:
+      type: object
+      description: Historical candle record (single price type - bid or ask).
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: Candle open time
+        open:
+          type: number
+          format: double
+          description: Open price
+        high:
+          type: number
+          format: double
+          description: High price
+        low:
+          type: number
+          format: double
+          description: Low price
+        close:
+          type: number
+          format: double
+          description: Close price
+        volume:
+          type: number
+          format: double
+          description: Candle volume
+
+    CandleHistoryResponse:
+      type: object
+      description: Candle history response.
+      properties:
+        candles:
+          type: array
+          description: List of candles. Format depends on `price_type` query parameter.
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/Candle"
+              - $ref: "#/components/schemas/CandleBidAsk"
+
+    CandleBidAsk:
+      type: object
+      description: Candle containing both bid and ask prices (when `price_type=both`).
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: Candle open time
+        bid:
+          $ref: "#/components/schemas/CandleSide"
+        ask:
+          $ref: "#/components/schemas/CandleSide"
+        volume:
+          type: number
+          format: double
+          description: Candle volume
+
+    CandleSide:
+      type: object
+      description: OHLC candle side (bid or ask).
+      properties:
+        open:
+          type: number
+          format: double
+          description: Open price
+        high:
+          type: number
+          format: double
+          description: High price
+        low:
+          type: number
+          format: double
+          description: Low price
+        close:
+          type: number
+          format: double
+          description: Close price
+
+    WSTick:
+      type: object
+      description: Real-time tick event for subscription.
+      properties:
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        bid:
+          type: number
+          format: double
+          description: Bid price
+        ask:
+          type: number
+          format: double
+          description: Ask price
+        timestamp:
+          type: string
+          format: date-time
+          description: Tick timestamp
+
+    # ------------------------------------------------------------------
+    # Trading domain models (Order, Position, Deal)
+    # ------------------------------------------------------------------
+
+    AccountState:
+      type: object
+      description: |
+       Current account monetary state.
+       All monetary values are expressed in the account currency.
+       Account monetary values are rounded according to the decimal precision of the account currency.
+       Examples with 2 decimal places assume an account currency that uses 2 decimal places.
+      required:
+        - balance
+        - equity
+        - used_margin
+      properties:
+        balance:
+          $ref: "#/components/schemas/DecimalString"
+          description: |
+            Account balance. Includes only realized results and posted balance operations.
+            Rounded according to the decimal precision of the account currency.
+        equity:
+          $ref: "#/components/schemas/DecimalString"
+          description: |
+            Account equity. Formula: `equity = balance + unrealized_PNL`
+            Rounded according to the decimal precision of the account currency.
+          x-formula: "equity = balance + unrealized_PNL"
+        used_margin:
+          $ref: "#/components/schemas/DecimalString"
+          description: |
+            Margin currently used to maintain open positions.
+            Rounded according to the decimal precision of the account currency.
+            Related metric: `free_margin = equity - used_margin`
+
+    Order:
+      type: object
+      description: |
+        Public order representation.
+        For `order_type=sltp`, some trading fields such as `direction`, `instrument`, `price`, and `volume` may be omitted if they are inherited from the related position.
+        When a pending order is placed with SL/TP, the main pending order and the related SLTP order may both be included as changed entities in the same `transaction_event`.
+      required:
+        - order_id
+        - order_type
+        - state
+        - create_time
+      properties:
+        order_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Order identifier
+        position_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Related position identifier, if this order is linked to a position.
+        order_type:
+          type: string
+          description: Public order type
+          enum:
+            - market
+            - stop
+            - limit
+            - sltp
+        state:
+          type: string
+          description: |
+             Order state
+
+             Possible states:
+             - placed = active pending order
+             - filled = executed order
+             - cancelled = cancelled before execution
+             - rejected = rejected by platform
+          enum:
+            - pending_new
+            - placed
+            - filled
+            - cancelled
+            - rejected
+        direction:
+          type: string
+          description: Order direction
+          enum:
+            - buy
+            - sell
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        price:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Order price
+        stop_loss_price:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          description: Stop loss price
+        take_profit_price:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          description: Take profit price
+        create_time:
+          type: string
+          format: date-time
+          description: Order creation time
+        update_time:
+          type: string
+          format: date-time
+          description: Last order update time
+        volume:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Order volume
+        reason:
+          $ref: "#/components/schemas/OrderReason"
+
+    Position:
+      type: object
+      description: Public position representation.
+      required:
+        - position_id
+        - direction
+        - instrument
+        - state
+        - create_time
+        - volume
+      properties:
+        position_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Position identifier
+        direction:
+          type: string
+          description: Position direction
+          enum:
+            - buy
+            - sell
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        initial_volume:
+          $ref: "#/components/schemas/DecimalString"
+          description: Initial position volume
+        volume:
+          $ref: "#/components/schemas/DecimalString"
+          description: Remaining position volume
+        open_price:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Position open price
+        state:
+          type: string
+          description: Position state
+          enum:
+            - open
+            - closed
+        margin_rate:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Margin rate
+        create_time:
+          type: string
+          format: date-time
+          description: Position creation time
+        commission:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Accumulated commission
+        swap:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Accumulated swap
+        rollover_time:
+          type: string
+          format: date-time
+          description: Last rollover time
+
+    ProfitAmount:
+      type: object
+      description: Profit amount structure.
+      properties:
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+          description: Profit amount value
+        currency:
+          type: string
+          description: Profit amount currency
+
+    Deal:
+      type: object
+      description: Public deal representation.
+      required:
+        - deal_id
+        - type
+        - create_time
+      properties:
+        deal_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Deal identifier
+        order_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description:  Related order identifier, if the deal was created as a result of an order execution.
+        position_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Related position identifier, if this deal is linked to a position.
+        type:
+          type: string
+          description: Deal type
+          enum:
+            - open
+            - close
+            - balance
+            - null_compensation
+            - swap_fee
+            - admin_fee
+            - dividend
+            - exness_dollar
+        direction:
+          type: string
+          description: |
+            Direction of trade-related deals.
+            Not applicable for balance-type deals.
+          enum:
+            - buy
+            - sell
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        volume:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Deal volume
+        price:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Deal price
+        profit:
+          $ref: "#/components/schemas/ProfitAmount"
+        create_time:
+          type: string
+          format: date-time
+          description: Deal creation time
+        commission:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Deal commission
+
+
+    # ------------------------------------------------------------------
+    # Trading Requests
+    # ------------------------------------------------------------------
+
+    OpenPositionRequest:
+      type: object
+      description: |
+        Open position request using immediate market execution.
+      required:
+        - instrument
+        - side
+        - volume
+      properties:
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        side:
+          type: string
+          description: Position direction
+          enum:
+            - buy
+            - sell
+        volume:
+          $ref: "#/components/schemas/InstrumentVolumeString"
+          description: Requested position volume
+        price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: |
+            Requested execution price.
+            Required when instrument `exec_mode` is `instant`.
+            Not applicable for `market` execution and will be ignored.
+        deviation:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: |
+            Optional maximum allowed price deviation for execution, expressed in points.
+            Applicable only when `exec_mode` is `instant` and `price` is provided.
+            If the execution price differs from the requested price within the deviation, the order may be executed at the new price without requote; if the difference exceeds it, the request may be rejected with requote.
+            If omitted, instant execution requires execution at the exact requested price or may result in requote.
+        stop_loss_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Optional Stop Loss price. Omit to open the position without Stop Loss.
+        take_profit_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Optional Take Profit price. Omit to open the position without Take Profit.
+        comment:
+          type: string
+          description: Optional client comment
+
+    NewPendingOrderRequest:
+      oneOf:
+        - $ref: "#/components/schemas/NewLimitOrderRequest"
+        - $ref: "#/components/schemas/NewStopOrderRequest"
+        - $ref: "#/components/schemas/NewSltpOrderRequest"
+
+    NewLimitOrderRequest:
+      type: object
+      description: |
+        New limit order request.
+        If `stop_loss_price` or `take_profit_price` is provided, the resulting `transaction_event` may include the main limit order and a related SLTP order.
+      required:
+        - instrument
+        - side
+        - type
+        - volume
+        - price
+      properties:
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        side:
+          type: string
+          description: Order direction
+          enum:
+            - buy
+            - sell
+        type:
+          type: string
+          enum:
+            - limit
+        volume:
+          $ref: "#/components/schemas/InstrumentVolumeString"
+          description: Requested order volume
+        price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Requested limit order price
+        stop_loss_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Optional Stop Loss price. Omit to create the order without Stop Loss.
+        take_profit_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Optional Take Profit price. Omit to create the order without Take Profit.
+        comment:
+          type: string
+          description: Optional client comment
+
+    NewStopOrderRequest:
+      type: object
+      description: |
+        New stop order request.
+        If `stop_loss_price` or `take_profit_price` is provided, the resulting `transaction_event` may include the main stop order and a related SLTP order.
+      required:
+        - instrument
+        - side
+        - type
+        - volume
+        - price
+      properties:
+        instrument:
+          $ref: "#/components/schemas/InstrumentName"
+        side:
+          type: string
+          description: Order direction
+          enum:
+            - buy
+            - sell
+        type:
+          type: string
+          enum:
+            - stop
+        volume:
+          $ref: "#/components/schemas/InstrumentVolumeString"
+          description: Requested order volume
+        price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Requested stop order price
+        stop_loss_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Optional Stop Loss price. Omit to create the order without Stop Loss.
+        take_profit_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Optional Take Profit price. Omit to create the order without Take Profit.
+        comment:
+          type: string
+          description: Optional client comment
+
+    NewSltpOrderRequest:
+      type: object
+      description: |
+        New SLTP order request.
+        `position_id` identifies the position to which SLTP is attached.
+      required:
+        - position_id
+        - type
+      properties:
+        position_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Position to which SLTP is attached.
+        type:
+          type: string
+          enum:
+            - sltp
+        stop_loss_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Stop Loss price. At least one of stop_loss_price or take_profit_price must be provided.
+        take_profit_price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Take Profit price. At least one of stop_loss_price or take_profit_price must be provided.
+        comment:
+          type: string
+          description: Optional client comment
+      anyOf:
+        - required: [stop_loss_price]
+        - required: [take_profit_price]
+
+    ModifyOrderRequest:
+      type: object
+      description: |
+        Modify active order request.
+
+        At least one of the following fields must be provided: `price`, `stop_loss_price`, `take_profit_price`.
+        Omitted fields are not changed.
+        Use `null` for `stop_loss_price` or `take_profit_price` to remove the corresponding SL/TP value.
+      properties:
+        price:
+          $ref: "#/components/schemas/InstrumentPriceString"
+          description: Updated order price
+        stop_loss_price:
+          allOf:
+            - $ref: "#/components/schemas/InstrumentPriceString"
+          nullable: true
+          description: Updated Stop Loss price. Use `null` to remove Stop Loss.
+        take_profit_price:
+          allOf:
+            - $ref: "#/components/schemas/InstrumentPriceString"
+          nullable: true
+          description: Updated Take Profit price. Use `null` to remove Take Profit.
+        comment:
+          type: string
+          description: Optional client comment
+      anyOf:
+        - required: [price]
+        - required: [stop_loss_price]
+        - required: [take_profit_price]
+
+    # ------------------------------------------------------------------
+    # History / snapshot responses
+    # ------------------------------------------------------------------
+
+    OperationStatusResponse:
+      type: object
+      required:
+        - operation_id
+        - status
+        - created_at
+        - updated_at
+      properties:
+        operation_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Operation identifier
+        status:
+          type: string
+          enum: [pending, confirmed, rejected, failed]
+          description: Current operation status
+        client_request_id:
+          type: string
+          description: Client-provided idempotency identifier, if supplied. Signed requests use `EXN-IDEMPOTENCY-KEY`.
+        error_code:
+          $ref: "#/components/schemas/PublicApiErrorCode"
+          description: Public business error code when status is `rejected` or `failed`.
+        error_message:
+          type: string
+          description: Stable public error message when status is `rejected` or `failed`.
+          example: TRADING_RULE_INVALID_PRICE_LEVELS
+        created_at:
+          type: string
+          format: date-time
+          description: Time the operation was accepted
+        updated_at:
+          type: string
+          format: date-time
+          description: Time the operation status was last updated
+
+    AckResponse:
+      type: object
+      description: Acknowledgement response for asynchronously processed trading requests.
+      required:
+        - status
+      properties:
+        operation_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Unique request identifier used for correlation and idempotency.
+        client_request_id:
+          type: string
+          description: Echoed client-provided idempotency identifier, if supplied. Signed requests use `EXN-IDEMPOTENCY-KEY`.
+        status:
+          type: string
+          description: Processing acknowledgement status
+          enum: [accepted]
+
+    AccountDetailsResponse:
+      type: object
+      description: Account details response.
+      required:
+        - account_id
+        - create_date
+      properties:
+        account_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: Account identifier
+          example: "152706877"
+        account_name:
+          type: string
+          description: Account name
+          example: Standard
+        create_date:
+          type: string
+          format: date-time
+          description: Account creation date
+          example: "2024-03-14T11:46:30+00:00"
+        settings:
+          $ref: "#/components/schemas/AccountSettings"
+
+    OrdersHistoryResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          description: Historical order records sorted by event_time in ascending order.
+          items:
+            $ref: "#/components/schemas/OrderHistoryItem"
+        next_cursor:
+          type: string
+          description: Opaque token for pagination. Omitted when there are no more items.
+        has_more:
+          type: boolean
+        range:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date-time
+            to:
+              type: string
+              format: date-time
+
+    OrderHistoryItem:
+      type: object
+      description: |
+         Historical order item.
+      required:
+        - event_time
+        - order
+      properties:
+        event_time:
+          type: string
+          format: date-time
+          description: Time used for sorting and pagination.
+        order:
+          $ref: "#/components/schemas/Order"
+
+    DealsHistoryResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          description: Historical deal records sorted by event_time in ascending order.
+          items:
+            $ref: "#/components/schemas/DealHistoryItem"
+        next_cursor:
+          type: string
+          description: Opaque token for pagination. Omitted when there are no more items.
+        has_more:
+          type: boolean
+        range:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date-time
+            to:
+              type: string
+              format: date-time
+
+    DealHistoryItem:
+      type: object
+      description: |
+         Historical deal item.
+      required:
+        - event_time
+        - deal
+      properties:
+        event_time:
+          type: string
+          format: date-time
+          description: Time used for sorting and pagination.
+        deal:
+          $ref: "#/components/schemas/Deal"
+
+    InstrumentNameListResponse:
+      type: object
+      description: Response containing only names of available instruments.
+      properties:
+        instruments:
+          type: array
+          description: List of instrument names
+          items:
+            $ref: "#/components/schemas/InstrumentName"
+
+    InstrumentConditionResponse:
+      type: object
+      description: |
+        Detailed trading conditions for a single instrument.
+        Optional properties in this response are omitted when the corresponding value is not available.
+      required:
+        - instrument
+      properties:
+        instrument:
+          allOf:
+            - $ref: "#/components/schemas/InstrumentName"
+          description: Instrument identifier.
+          example: EURUSD
+        description:
+          type: string
+          example: Euro vs US Dollar
+        international_name:
+          type: string
+          nullable: true
+          example: EUR/USD
+        category:
+          type: string
+          example: Forex
+        base_currency:
+          type: string
+          example: EUR
+        quote_currency:
+          type: string
+          example: USD
+        margin_currency:
+          type: string
+          example: EUR
+        point_digits:
+          type: integer
+          format: int32
+          description: |
+            Number of decimal digits allowed after the point for instrument prices.
+            Request price fields (`price`, `stop_loss_price`, `take_profit_price`) must not use more fractional digits than this value.
+            The implied minimum price increment is `10^-point_digits`.
+          example: 5
+        calc_mode:
+          $ref: "#/components/schemas/CalculationMode"
+        exec_mode:
+          $ref: "#/components/schemas/ExecutionMode"
+        margin_percent:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          example: "1"
+        contract_size:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          description: Contract size represented as a decimal string.
+          example: "100000"
+        volume_min:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          description: |
+            Minimum tradable volume represented as a decimal string.
+            Use together with `volume_max` and `volume_step` to validate `volume` in position-open and pending-order requests.
+          example: "0.01"
+        volume_max:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          description: |
+            Maximum tradable volume represented as a decimal string.
+            Use together with `volume_min` and `volume_step` to validate `volume` in position-open and pending-order requests.
+          example: "200"
+        volume_step:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          description: |
+            Volume increment represented as a decimal string.
+            Valid request volumes must align to this step from `volume_min`.
+          example: "0.01"
+        swap_long:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          example: "-6.35"
+        swap_short:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          nullable: true
+          example: "2.14"
+        swap_multipliers:
+          type: array
+          items:
+            $ref: "#/components/schemas/SwapMultiplier"
+        trade_mode:
+          $ref: "#/components/schemas/TradeMode"
+        order_types:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstrumentOrderType"
+        filling_modes:
+          type: array
+          items:
+            $ref: "#/components/schemas/FillingMode"
+        trade_sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/InstrumentSession"
+        commission_settings:
+          $ref: "#/components/schemas/CommissionSettings"
+
+    LimitsResponse:
+      type: object
+      additionalProperties: false
+      description: Effective REST and WebSocket limits for the account.
+      required:
+        - limits
+      properties:
+        limits:
+          $ref: "#/components/schemas/ApiLimits"
+
+    ApiLimits:
+      type: object
+      additionalProperties: false
+      required:
+        - rest
+        - websocket
+      properties:
+        rest:
+          $ref: "#/components/schemas/RestLimits"
+        websocket:
+          $ref: "#/components/schemas/WebSocketLimits"
+
+    RestLimits:
+      type: object
+      additionalProperties: false
+      description: REST limits. Reported rates cover the complete AP cluster.
+      required:
+        - global_account_rate
+        - methods
+      properties:
+        global_account_rate:
+          $ref: "#/components/schemas/GlobalRestRateLimit"
+        methods:
+          type: array
+          description: Effective limit and static OpenAPI metadata for every REST operation.
+          items:
+            $ref: "#/components/schemas/RestMethodLimits"
+
+    GlobalRestRateLimit:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - window_seconds
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          description: Maximum requests allowed during the window across the AP cluster.
+        window_seconds:
+          type: integer
+          minimum: 1
+          description: Rate-limit window duration in seconds.
+
+    ApiRateLimit:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - window_seconds
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          description: Maximum operations allowed during the window.
+        window_seconds:
+          type: integer
+          minimum: 1
+          description: Rate-limit window duration in seconds.
+
+    RestMethodLimits:
+      type: object
+      additionalProperties: false
+      required:
+        - api_operation_id
+        - http_method
+        - path
+        - rate_limit
+      properties:
+        api_operation_id:
+          type: string
+          description: Exact OpenAPI operationId used as the rate-limit configuration key.
+        http_method:
+          $ref: "#/components/schemas/HttpMethod"
+        path:
+          type: string
+          description: OpenAPI path template.
+        rate_limit:
+          $ref: "#/components/schemas/ApiRateLimit"
+        limits:
+          $ref: "#/components/schemas/OperationRequestLimits"
+
+    HttpMethod:
+      type: string
+      description: Uppercase HTTP request method from the OpenAPI operation.
+      enum: [GET, POST, PUT, PATCH, DELETE]
+
+    OperationRequestLimits:
+      type: object
+      additionalProperties: false
+      description: Request-shape limits applicable to an individual REST operation.
+      properties:
+        max_candles_per_request:
+          type: integer
+          minimum: 1
+          description: Maximum number of candles accepted by one request.
+        max_candles_per_request_description:
+          type: string
+          description: Human-readable explanation of the candle request limit.
+        history_range_days:
+          type: integer
+          minimum: 1
+          description: Maximum duration of a requested history range in days.
+        history_age_days:
+          type: integer
+          minimum: 1
+          description: Maximum age of requested history in days.
+
+    WebSocketLimits:
+      type: object
+      additionalProperties: false
+      description: Global WebSocket protection and limits for individual stream endpoints.
+      required:
+        - global_account_limits
+        - endpoints
+      properties:
+        global_account_limits:
+          $ref: "#/components/schemas/WebSocketGlobalAccountLimits"
+        endpoints:
+          type: array
+          description: Effective per-endpoint limits and static OpenAPI metadata.
+          items:
+            $ref: "#/components/schemas/WebSocketEndpointLimits"
+
+    WebSocketGlobalAccountLimits:
+      type: object
+      additionalProperties: false
+      description: WebSocket limits shared by every stream endpoint for an account on one server node.
+      required:
+        - max_active_connections
+        - max_inbound_message_bytes
+        - connection_rate
+        - inbound_message_rate
+        - strikes
+      properties:
+        max_active_connections:
+          type: integer
+          minimum: 1
+          description: Maximum concurrently active WebSocket connections.
+        max_inbound_message_bytes:
+          type: integer
+          minimum: 1
+          description: Maximum accepted size of one inbound client message, in bytes.
+        connection_rate:
+          $ref: "#/components/schemas/WebSocketTokenBucketLimit"
+        inbound_message_rate:
+          $ref: "#/components/schemas/WebSocketTokenBucketLimit"
+        strikes:
+          $ref: "#/components/schemas/WebSocketStrikeLimits"
+
+    WebSocketEndpointLimits:
+      type: object
+      additionalProperties: false
+      description: Limits independently enforced for a WebSocket stream endpoint on one server node.
+      required:
+        - api_operation_id
+        - http_method
+        - path
+        - connection_rate
+        - inbound_message_rate
+        - subscription_operation_rate
+      properties:
+        api_operation_id:
+          type: string
+          description: Exact OpenAPI operationId used as the endpoint configuration key.
+        http_method:
+          $ref: "#/components/schemas/HttpMethod"
+        path:
+          type: string
+          description: OpenAPI path template.
+        connection_rate:
+          $ref: "#/components/schemas/WebSocketTokenBucketLimit"
+        inbound_message_rate:
+          $ref: "#/components/schemas/WebSocketTokenBucketLimit"
+        subscription_operation_rate:
+          type: object
+          description: >
+            Per-subscription-type subscribe limits applicable to this endpoint. Unsubscribe operations
+            remain subject only to inbound-message limits.
+          additionalProperties:
+            $ref: "#/components/schemas/WebSocketTokenBucketLimit"
+
+    WebSocketTokenBucketLimit:
+      type: object
+      additionalProperties: false
+      description: Token-bucket rate enforced per account on one server node.
+      required:
+        - limit
+        - window_seconds
+        - burst
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          description: Tokens refilled during each window.
+        window_seconds:
+          type: number
+          format: double
+          exclusiveMinimum: 0
+          description: Refill window duration in seconds.
+        burst:
+          type: integer
+          minimum: 1
+          description: Maximum token-bucket capacity.
+
+    WebSocketStrikeLimits:
+      type: object
+      additionalProperties: false
+      description: Abuse strike budget shared across WebSocket endpoints on one server node.
+      required:
+        - refill_amount
+        - threshold
+        - period_ms
+      properties:
+        refill_amount:
+          type: integer
+          minimum: 1
+          description: Number of strikes forgiven per decay interval.
+        threshold:
+          type: integer
+          minimum: 1
+          description: Number of strikes tolerated before the connection is terminated.
+        period_ms:
+          type: integer
+          minimum: 1
+          description: Strike decay interval in milliseconds.
+
+    # ------------------------------------------------------------------
+    # Streaming / WS schemas
+    # ------------------------------------------------------------------
+
+    WSEventsCommandRequestData:
+      oneOf:
+        - $ref: "#/components/schemas/WSEventsSubscribeRequestData"
+        - $ref: "#/components/schemas/WSEventsUnsubscribeRequestData"
+
+    WSEventsSubscribeRequestData:
+      type: object
+      description: Subscription request for trading event stream.
+      required:
+        - id
+        - subscribe
+      properties:
+        id:
+          type: string
+          description: Client-generated subscription request identifier.
+        subscribe:
+          $ref: "#/components/schemas/TradingEventsSubscription"
+
+    WSEventsUnsubscribeRequestData:
+      type: object
+      description: |
+        Unsubscription request for trading event stream.
+
+        For `instruments`, the `instruments` field contains the instruments to remove from the
+        active subscription. Use exactly `["all"]` to unsubscribe from all instrument updates.
+
+        For `hmr`, the `instruments` field contains the instruments to remove from the active HMR
+        subscription. Instruments that are not currently subscribed are ignored; the request is not
+        validated against account availability and is not rejected for unknown instruments.
+      required:
+        - id
+        - unsubscribe
+      properties:
+        id:
+          type: string
+          description: Client-generated unsubscription request identifier.
+        unsubscribe:
+          $ref: "#/components/schemas/TradingEventsSubscription"
+
+    TradingEventsSubscription:
+      oneOf:
+        - $ref: "#/components/schemas/TradingTransactionsSubscription"
+        - $ref: "#/components/schemas/TradingAccountStateSubscription"
+        - $ref: "#/components/schemas/TradingInstrumentsSubscription"
+        - $ref: "#/components/schemas/TradingHmrSubscription"
+
+    TradingTransactionsSubscription:
+      type: object
+      required:
+        - event
+      properties:
+        event:
+          type: string
+          enum:
+            - transactions
+
+    TradingAccountStateSubscription:
+      type: object
+      required:
+        - event
+      properties:
+        event:
+          type: string
+          enum:
+            - account_state
+
+    TradingHmrSubscription:
+      type: object
+      required:
+        - event
+        - instruments
+      properties:
+        event:
+          type: string
+          enum:
+            - hmr
+        instruments:
+          type: array
+          minItems: 1
+          description: >
+            Explicit list of instrument names to receive HMR period events for. Requested instruments
+            must be available for the selected account.
+          items:
+            $ref: "#/components/schemas/InstrumentName"
+
+    TradingInstrumentsSubscription:
+      type: object
+      required:
+        - event
+        - instruments
+      properties:
+        event:
+          type: string
+          enum:
+            - instruments
+        instruments:
+          type: array
+          minItems: 1
+          description: >
+            List of instrument names to subscribe to. Requested instruments must be available
+            for the selected account. Use exactly `["all"]` to subscribe to all instrument
+            updates available for the selected account. Do not combine `all` with specific
+            instrument names.
+          items:
+            $ref: "#/components/schemas/InstrumentName"
+
+    WSTicksSubscribeRequestData:
+      type: object
+      description: Subscription request for tick stream.
+      required:
+        - id
+        - subscribe
+      properties:
+        id:
+          type: string
+          description: Client-generated subscription request identifier
+        subscribe:
+          type: object
+          required:
+            - event
+            - instruments
+          description: Subscription payload
+          properties:
+            event:
+              type: string
+              description: Event type to subscribe to
+              enum:
+                - ticks
+            instruments:
+              type: array
+              description: List of instruments
+              items:
+                $ref: "#/components/schemas/InstrumentName"
+
+    AccountStateEventPayload:
+      type: object
+      description: |
+        Periodic account floating state payload.
+
+        In the current version, this payload is used for equity monitoring.
+        It contains the current account_state snapshot after account floating state recalculation.
+
+        Balance operations and trading transactions are not delivered through this event type.
+        They are delivered through `transaction_event`.
+      required:
+        - account_state
+      properties:
+        account_state:
+          $ref: "#/components/schemas/AccountState"
+
+    TradingStateSnapshot:
+      type: object
+      description: |
+        Current trading state snapshot for the account.
+
+        This payload is returned by the REST trading state endpoint and is also
+        delivered immediately after subscribing to the transactions stream.
+      required:
+        - account_state
+      properties:
+        orders:
+          type: array
+          description: Currently active orders for the account.
+          items:
+            $ref: "#/components/schemas/Order"
+        positions:
+          type: array
+          description: Currently open positions for the account.
+          items:
+            $ref: "#/components/schemas/Position"
+        account_state:
+          $ref: "#/components/schemas/AccountState"
+
+    TransactionAccountState:
+      allOf:
+        - $ref: "#/components/schemas/AccountState"
+        - type: object
+          description: Account state as delivered in transaction events.
+          required:
+            - leverage
+          properties:
+            leverage:
+              type: string
+              description: Account leverage.
+
+    TransactionPayload:
+      type: object
+      description: |
+       Finalized transaction payload delivered through the transaction event stream.
+
+       Transaction is a meta-entity. It does not have its own transaction identifier.
+       It groups order, deal, position and account_state changes that belong to the same finalized event.
+
+       The payload contains only entities created or changed as a result of this concrete transaction.
+
+       Payload composition defines the transaction meaning:
+       - trading transaction: contains changed orders, deals and/or positions
+       - non-trading balance transaction: contains a balance-type deal and account_state
+
+       Operation correlation fields are placed at the event envelope level as `operation_id` and `client_request_id`.
+
+       The payload contains only entities created or changed as a result of this concrete transaction. It must not contain all historically related entities.
+      properties:
+        orders:
+          type: array
+          description: Orders created or changed by this transaction.
+          items:
+           $ref: "#/components/schemas/Order"
+        positions:
+          type: array
+          description: Positions created or changed by this transaction.
+          items:
+           $ref: "#/components/schemas/Position"
+        deals:
+          type: array
+          description: Deals created by this transaction, including trading and balance deals.
+          items:
+           $ref: "#/components/schemas/Deal"
+        account_state:
+          $ref: "#/components/schemas/TransactionAccountState"
+
+    WSTradingEvent:
+      oneOf:
+        - $ref: "#/components/schemas/WSTradingStateSnapshotEvent"
+        - $ref: "#/components/schemas/WSTradingTransactionEvent"
+        - $ref: "#/components/schemas/WSAccountStateEvent"
+        - $ref: "#/components/schemas/WSInstrumentEvent"
+        - $ref: "#/components/schemas/WSHmrSnapshotEvent"
+        - $ref: "#/components/schemas/WSHmrUpdateEvent"
+      discriminator:
+        propertyName: event_type
+        mapping:
+          trading_state_snapshot: "#/components/schemas/WSTradingStateSnapshotEvent"
+          transaction_event: "#/components/schemas/WSTradingTransactionEvent"
+          account_state_event: "#/components/schemas/WSAccountStateEvent"
+          instrument_event: "#/components/schemas/WSInstrumentEvent"
+          hmr_snapshot: "#/components/schemas/WSHmrSnapshotEvent"
+          hmr_update: "#/components/schemas/WSHmrUpdateEvent"
+
+    WSTradingStateSnapshotEvent:
+      type: object
+      description: Trading streaming event envelope for the initial trading state snapshot.
+      required:
+        - event_type
+        - payload
+      properties:
+        event_type:
+          type: string
+          enum:
+            - trading_state_snapshot
+        payload:
+          $ref: "#/components/schemas/TradingStateSnapshot"
+
+    WSTradingTransactionEvent:
+      type: object
+      description: |
+        Trading streaming event envelope for finalized transactions and processing results.
+
+        Trading snapshot may represent active SL/TP values directly on the related pending order,
+        while `transaction_event` may include a separate SLTP order as one of the changed entities.
+      required:
+        - event_type
+        - payload
+      properties:
+        event_type:
+          type: string
+          enum:
+            - transaction_event
+        operation_id:
+          allOf:
+            - $ref: "#/components/schemas/UInt64String"
+          description: |
+            Concrete operation identifier associated with this transaction event.
+            Omitted when absent, including for system-generated updates and non-trading balance transactions.
+        client_request_id:
+          type: string
+          nullable: true
+          description: |
+            Client-provided idempotency identifier, if supplied.
+            Signed requests use `EXN-IDEMPOTENCY-KEY`.
+            Allows correlating transaction events with originating REST requests without
+            storing the `operation_id` mapping on the client side.
+        status:
+          $ref: "#/components/schemas/TradingEventStatus"
+        error_code:
+          $ref: "#/components/schemas/PublicApiErrorCode"
+          description: Business error code for rejected or failed processing results.
+        error_message:
+          type: string
+          description: Stable public error message for rejected or failed processing results.
+          example: TRADING_RULE_INSUFFICIENT_MARGIN
+        event_time:
+          type: string
+          format: date-time
+          description: Time when the transaction or processing result occurred.
+        payload:
+          $ref: "#/components/schemas/TransactionPayload"
+
+    WSAccountStateEvent:
+      type: object
+      description: Trading streaming event envelope for periodic account state updates.
+      required:
+        - event_type
+        - event_time
+        - payload
+      properties:
+        event_type:
+          type: string
+          enum:
+            - account_state_event
+        event_time:
+          type: string
+          format: date-time
+          description: Time when the account state snapshot was generated.
+        payload:
+          $ref: "#/components/schemas/AccountStateEventPayload"
+
+    WSInstrumentEvent:
+      type: object
+      description: >
+        Event envelope for account-scoped instrument condition/configuration updates.
+        The payload contains a full current instrument condition snapshot for the selected account.
+      required:
+        - event_type
+        - event_time
+        - action
+        - payload
+      properties:
+        event_type:
+          type: string
+          enum:
+            - instrument_event
+        event_time:
+          type: string
+          format: date-time
+          description: Time when the instrument condition update was generated.
+        action:
+          $ref: "#/components/schemas/InstrumentEventAction"
+        payload:
+          $ref: "#/components/schemas/InstrumentConditionResponse"
+
+    # ------------------------------------------------------------------
+    # HMR period schemas
+    # ------------------------------------------------------------------
+
+    WSHmrSnapshotEvent:
+      type: object
+      description: |
+        `hmr_snapshot` contains the full active and scheduled future HMR period state applicable to the selected account.
+        The server sends it after a successful `hmr` subscription and may send it again only when the account's
+        effective flexible HMR status changes during the active session.
+
+        HMR snapshot events are delivered without the generic `payload` wrapper.
+        The `periods` field is placed at the event top level.
+        `event_time` is not included in the current version.
+      required:
+        - event_type
+        - periods
+      properties:
+        event_type:
+          type: string
+          enum:
+            - hmr_snapshot
+        periods:
+          type: array
+          description: Full active and scheduled future set of HMR periods applicable to the selected account.
+          items:
+            $ref: "#/components/schemas/HmrPeriod"
+
+    WSHmrUpdateEvent:
+      type: object
+      description: |
+        `hmr_update` contains incremental HMR period changes observed while the subscription is active.
+        Apply updates on top of the latest snapshot; replace local state whenever a new snapshot arrives.
+
+        HMR update events are delivered without the generic `payload` wrapper.
+        The `upserted_periods` and `removed_period_ids` fields are placed at the event top level.
+        `event_time` is not included in the current version.
+      required:
+        - event_type
+        - upserted_periods
+        - removed_period_ids
+      properties:
+        event_type:
+          type: string
+          enum:
+            - hmr_update
+        upserted_periods:
+          type: array
+          description: HMR periods that were created or updated.
+          items:
+            $ref: "#/components/schemas/HmrPeriod"
+        removed_period_ids:
+          type: array
+          description: Removed HMR period identifiers.
+          items:
+            $ref: "#/components/schemas/UInt64String"
+
+    HmrPeriod:
+      type: object
+      description: |
+        High Margin Requirement period visible to the client. Snapshot periods may be active now or scheduled
+        for the future.
+      required:
+        - period_id
+        - event_type
+        - instruments
+        - leverage
+        - start_time
+        - end_time
+      properties:
+        period_id:
+          $ref: "#/components/schemas/UInt64String"
+        event_type:
+          $ref: "#/components/schemas/HmrPeriodEventType"
+        instruments:
+          type: array
+          minItems: 1
+          description: Instruments affected by this HMR period.
+          items:
+            $ref: "#/components/schemas/InstrumentName"
+        leverage:
+          type: string
+          description: Maximum leverage during the HMR period.
+        start_time:
+          type: string
+          description: |
+            HMR period start time as configured by the server. `regular` periods use absolute
+            `YYYY-MM-DD HH:MM:SS` time; `periodic` periods use weekly `Day, HH:MM:SS` time.
+        end_time:
+          type: string
+          description: |
+            HMR period end time as configured by the server. `regular` periods use absolute
+            `YYYY-MM-DD HH:MM:SS` time; `periodic` periods use weekly `Day, HH:MM:SS` time.
+
+    HmrPeriodEventType:
+      type: string
+      description: |
+        HMR period schedule type:
+        - `regular` - a certain one-time event
+        - `periodic` - an event that repeats every week
+      enum:
+        - regular
+        - periodic
+
+    AccountSettings:
+      type: object
+      description: Account settings.
+      required:
+        - currency
+        - leverage
+        - account_status
+        - trade_mode
+        - execution_mode
+      properties:
+        currency:
+          type: string
+          description: Account currency
+        leverage:
+          type: string
+          description: Account leverage
+        margin_call_level:
+          $ref: "#/components/schemas/DecimalString"
+          description: Margin call level
+        stopout_level:
+          $ref: "#/components/schemas/DecimalString"
+          description: Stop out level
+        trade_mode:
+          $ref: "#/components/schemas/TradeMode"
+        account_status:
+          $ref: "#/components/schemas/AccountTradingStatus"
+        execution_mode:
+          $ref: "#/components/schemas/ExecutionMode"
+
+    SwapMultiplier:
+      type: object
+      properties:
+        day:
+          type: string
+          example: WED
+        multiplier:
+          type: integer
+          format: int32
+          example: 3
+
+    CommissionSettings:
+      type: object
+      properties:
+        commission_type:
+          $ref: "#/components/schemas/CommissionType"
+        commission_value:
+          $ref: "#/components/schemas/Money"
+
+    InstrumentSession:
+      type: object
+      description: Optional instrument session details. Boundary fields are omitted when not provided.
+      properties:
+        trade_mode:
+          $ref: "#/components/schemas/TradeMode"
+        week_start_time:
+          type: string
+          description: Session start time in UTC. Omitted when the session start boundary is not provided.
+          example: "Mon, 10:00:00"
+        week_end_time:
+          type: string
+          description: Session end time in UTC. Omitted when the session end boundary is not provided.
+          example: "Mon, 11:59:59"
