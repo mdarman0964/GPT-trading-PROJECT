@@ -45,7 +45,7 @@ def run_account_backtest(trades: pd.DataFrame, cfg: AccountConfig = AccountConfi
     """Size each non-overlapping trade to account risk and calculate USD equity."""
     cfg.validate()
     required = {"entry_time", "exit_time", "entry_index", "exit_index",
-                "entry_mid", "pnl_price", "stop_distance", "entry_spread",
+                "entry_mid", "pnl_price", "stop_distance", "risk_distance", "entry_spread",
                 "exit_spread", "hypothesis"}
     missing = sorted(required.difference(trades.columns))
     if missing and not trades.empty:
@@ -68,7 +68,7 @@ def run_account_backtest(trades: pd.DataFrame, cfg: AccountConfig = AccountConfi
 
         entry_cost = float(t.entry_spread) / 2.0
         exit_cost = float(t.exit_spread) / 2.0
-        risk_per_unit_price = (float(t.stop_distance) + entry_cost + exit_cost)
+        risk_per_unit_price = float(t.risk_distance)
         if risk_per_unit_price <= 0:
             continue
         commission = cfg.commission_usd_per_lot_round_turn
