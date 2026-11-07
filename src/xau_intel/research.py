@@ -30,7 +30,7 @@ def audit(df: pd.DataFrame) -> dict:
         "gaps_over_1m": int((gaps > pd.Timedelta(minutes=1)).sum()),
         "median_spread": float(df["spread"].median()),
         "max_spread": float(df["spread"].max()),
-        "timezone": "unspecified; timestamps interpreted as naive source timestamps"
+        "timezone": "UTC+04:00 (Asia/Dubai), as supplied by the dataset owner; stored timestamps remain naive"
     }
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
