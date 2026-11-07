@@ -3,6 +3,7 @@ from .research import load_candles, audit, add_features
 from .hypotheses import build_hypotheses
 from .backtest import BacktestConfig, run_backtest, write_report
 from .account import AccountConfig, run_account_backtest
+from .market_intelligence import IntelligenceConfig, build_market_intelligence
 
 def main():
     p = argparse.ArgumentParser(description="XAUUSD integrated research tools")
@@ -10,6 +11,10 @@ def main():
     a = sub.add_parser("audit"); a.add_argument("--csv", required=True)
     f = sub.add_parser("features"); f.add_argument("--csv", required=True); f.add_argument("--out", required=True)
     h = sub.add_parser("hypotheses"); h.add_argument("--csv", required=True); h.add_argument("--out", required=True)
+    mi = sub.add_parser("intelligence", help="Build causal, gap-aware market intelligence features")
+    mi.add_argument("--csv", required=True); mi.add_argument("--out", default="output/market_intelligence.csv")
+    mi.add_argument("--swing-left", type=int, default=3); mi.add_argument("--swing-right", type=int, default=3)
+    mi.add_argument("--liquidity-lookback", type=int, default=240)
     b = sub.add_parser("backtest")
     b.add_argument("--csv", required=True)
     b.add_argument("--trades-out", default="output/trades.csv")
@@ -45,6 +50,19 @@ def main():
     elif args.cmd == "features":
         add_features(df).to_csv(args.out, index=False)
         print(f"Wrote {len(df)} feature rows to {args.out}")
+    elif args.cmd == "intelligence":
+        cfg = IntelligenceConfig(swing_left=args.swing_left, swing_right=args.swing_right,
+                                 liquidity_lookback=args.liquidity_lookback)
+        result = build_market_intelligence(df, cfg)
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(args.out, index=False)
+        event_cols = ["sweep_high", "sweep_low", "displacement_up", "displacement_down",
+                      "bullish_fvg", "bearish_fvg"]
+        print(json.dumps({"rows": len(result), "segments": int(result.segment_id.nunique()),
+                          "gap_rows": int(result.gap_before.sum()),
+                          "events": {c: int(result[c].sum()) for c in event_cols},
+                          "output": args.out,
+                          "note": "Causal price-action proxies, not direct evidence of institutional orders."}, indent=2))
     elif args.cmd == "hypotheses":
         result = build_hypotheses(df)
         result.to_csv(args.out, index=False)
