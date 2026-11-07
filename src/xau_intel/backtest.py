@@ -47,28 +47,35 @@ SIGNALS = {
 
 def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
                      cfg: BacktestConfig) -> list[dict]:
+    """Numpy-backed equivalent of the bar simulator; avoids millions of DataFrame iloc calls."""
     trades: list[dict] = []
-    i = 0
+    signals = df[signal_col].to_numpy(dtype=bool)
+    spread_ok = df["spread_ok"].to_numpy(dtype=bool)
+    atr = df["atr"].to_numpy(dtype=float)
+    spread = df["spread"].to_numpy(dtype=float)
+    open_ = df["open"].to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    close = df["close"].to_numpy(dtype=float)
+    times = df["time"].astype(str).to_numpy()
+    spread_ratio = df["spread_to_atr"].to_numpy(dtype=float)
     n = len(df)
+    i = 0
+
     while i < n - 1:
-        row = df.iloc[i]
-        spread_ratio = row.get("spread_to_atr")
-        spread_ok = bool(row.get("spread_ok", False))
-        if not bool(row[signal_col]) or (cfg.require_spread_filter and not spread_ok):
+        if not signals[i] or (cfg.require_spread_filter and not spread_ok[i]):
             i += 1
             continue
-        atr = float(row["atr"])
-        if not pd.notna(atr) or atr <= 0:
+        signal_atr = atr[i]
+        if not pd.notna(signal_atr) or signal_atr <= 0:
             i += 1
             continue
 
         entry_i = i + 1
-        entry_bar = df.iloc[entry_i]
-        entry_mid = float(entry_bar["open"])
-        entry_spread = float(entry_bar["spread"])
+        entry_mid = float(open_[entry_i])
+        entry_spread = float(spread[entry_i])
         half_entry_cost = entry_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
-        distance = cfg.stop_atr * atr
-
+        distance = cfg.stop_atr * signal_atr
         if side == 1:
             entry_fill = entry_mid + half_entry_cost
             stop_level = entry_mid - distance
@@ -81,11 +88,10 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
         last_i = min(n - 1, entry_i + cfg.max_hold_bars - 1)
         exit_i = last_i
         exit_reason = "time"
-        exit_mid = float(df.iloc[last_i]["close"])
+        exit_mid = float(close[last_i])
 
         for j in range(entry_i, last_i + 1):
-            bar = df.iloc[j]
-            o, h, l = float(bar["open"]), float(bar["high"]), float(bar["low"])
+            o, h, l = float(open_[j]), float(high[j]), float(low[j])
             if side == 1:
                 if o <= stop_level:
                     exit_i, exit_mid, exit_reason = j, o, "stop_gap"
@@ -93,11 +99,10 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
                 if o >= target_level:
                     exit_i, exit_mid, exit_reason = j, o, "target_gap"
                     break
-                hit_stop, hit_target = l <= stop_level, h >= target_level
-                if hit_stop:  # Conservative ordering if both are touched.
+                if l <= stop_level:
                     exit_i, exit_mid, exit_reason = j, stop_level, "stop"
                     break
-                if hit_target:
+                if h >= target_level:
                     exit_i, exit_mid, exit_reason = j, target_level, "target"
                     break
             else:
@@ -107,36 +112,35 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
                 if o <= target_level:
                     exit_i, exit_mid, exit_reason = j, o, "target_gap"
                     break
-                hit_stop, hit_target = h >= stop_level, l <= target_level
-                if hit_stop:
+                if h >= stop_level:
                     exit_i, exit_mid, exit_reason = j, stop_level, "stop"
                     break
-                if hit_target:
+                if l <= target_level:
                     exit_i, exit_mid, exit_reason = j, target_level, "target"
                     break
 
-        exit_spread = float(df.iloc[exit_i]["spread"])
+        exit_spread = float(spread[exit_i])
         half_exit_cost = exit_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
         exit_fill = (exit_mid - half_exit_cost) if side == 1 else (exit_mid + half_exit_cost)
         pnl = (exit_fill - entry_fill) * side
         risk_distance = distance + half_entry_cost + half_exit_cost
         trades.append({
             "hypothesis": signal_col, "side": "long" if side == 1 else "short",
-            "signal_time": str(row["time"]), "entry_time": str(entry_bar["time"]),
-            "exit_time": str(df.iloc[exit_i]["time"]),
+            "signal_time": times[i], "entry_time": times[entry_i],
+            "exit_time": times[exit_i],
             "entry_index": entry_i, "exit_index": exit_i,
             "entry_mid": entry_mid, "entry_fill": entry_fill,
             "exit_mid": exit_mid, "exit_fill": exit_fill,
             "entry_spread": entry_spread, "exit_spread": exit_spread,
-            "atr_at_signal": atr, "stop_distance": distance, "risk_distance": risk_distance,
-            "exit_reason": exit_reason, "pnl_price": pnl,
+            "atr_at_signal": float(signal_atr), "stop_distance": distance,
+            "risk_distance": risk_distance, "exit_reason": exit_reason,
+            "pnl_price": pnl,
             "r_multiple": pnl / risk_distance if risk_distance > 0 else 0.0,
-            "spread_to_atr_at_signal": spread_ratio,
+            "spread_to_atr_at_signal": float(spread_ratio[i]),
             "bars_held": exit_i - entry_i + 1,
         })
-        i = exit_i + 1  # No overlapping positions in this hypothesis stream.
+        i = exit_i + 1
     return trades
-
 
 def summarize(trades: pd.DataFrame) -> dict:
     if trades.empty:
