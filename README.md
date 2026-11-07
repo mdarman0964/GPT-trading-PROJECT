@@ -58,3 +58,11 @@ simulation and does not send demo or live orders.
 7. Set hard risk limits and require explicit approval before any live deployment.
 
 Never commit API keys, private keys, passwords or account secrets.
+
+## Exness configuration (read-only)
+
+The project can now read account settings and XAUUSD trading conditions from
+the Exness Trader API without placing orders. Configure the API credentials,
+account ID, and the account Access Point securely, then run `exness-config`.
+See [the setup guide](docs/EXNESS_READ_ONLY_SETUP.md). Never commit or paste
+private signing keys. This command is read-only and does not enable trading.
