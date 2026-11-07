@@ -1,0 +1,46 @@
+name: XAUUSD historical research
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "BOT/hist_XAUUSD_M1_a.csv"
+      - "src/xau_intel/**"
+      - ".github/workflows/xauusd-research.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  historical-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e .
+      - name: Audit supplied XAUUSD M1 data
+        run: |
+          mkdir -p output
+          python -m xau_intel.cli audit --csv BOT/hist_XAUUSD_M1_a.csv > output/data_audit.json
+      - name: Run conservative historical backtest
+        run: |
+          python -m xau_intel.cli backtest \
+            --csv BOT/hist_XAUUSD_M1_a.csv \
+            --trades-out output/trades.csv \
+            --report-out output/backtest_report.json \
+            --stop-atr 1.0 \
+            --target-r 1.5 \
+            --max-hold-bars 60
+      - name: Upload reproducible research outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: xauusd-m1-research-${{ github.sha }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
