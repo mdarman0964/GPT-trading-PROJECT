@@ -39,7 +39,7 @@ PYTHONPATH=src python -m xau_intel.cli account-backtest --csv data/hist_XAUUSD_M
 
 ## Data notes
 
-The current supplied dataset contains 353,307 XAUUSD M1 candles from 2025-11-07 04:20 to 2026-11-06 21:57 as stored in the file. Timestamps have no declared timezone. There are 275 gaps greater than one minute; these must be classified before session analysis. Spread median is 0.24; 99.9th percentile is 0.60. CSV rows should be audited again when the dataset changes.
+The current supplied dataset contains 353,307 XAUUSD M1 candles from 2025-11-07 04:20 to 2026-11-06 21:57 as stored in the file. The dataset owner confirmed timestamps are UTC+04:00 (Asia/Dubai); the CSV values remain unchanged and are interpreted in that timezone for session/day analysis. Earlier audit found 275 gaps greater than one minute; classify these before session analysis. Earlier spread diagnostics found a median of 0.24 and 99.9th percentile of 0.60. Re-run the audit whenever the dataset changes.
 
 See [USD account simulation assumptions](docs/ACCOUNT_SIMULATION.md). The account simulation
 uses one global position at a time and skips overlapping candidates. Contract size and
