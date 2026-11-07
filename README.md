@@ -14,6 +14,7 @@ This is an **offline research foundation**, not a proven profitable strategy and
 - Reproducible command-line research tools
 - USD-denominated account simulation with risk-based lot sizing, estimated margin, equity curve and drawdown
 - API integration and validation roadmap
+- Gap-aware market intelligence: confirmed swings, equal-level candidates, sweep proxies, displacement, fair-value-gap candidates and DST-aware London/New York sessions
 
 ## Setup
 
@@ -30,6 +31,7 @@ pip install -r requirements.txt
 ```bash
 PYTHONPATH=src python -m xau_intel.cli audit --csv data/hist_XAUUSD_M1_a.csv
 PYTHONPATH=src python -m xau_intel.cli features --csv data/hist_XAUUSD_M1_a.csv --out reports/features.csv
+PYTHONPATH=src python -m xau_intel.cli intelligence --csv BOT/hist_XAUUSD_M1_a.csv --out output/market_intelligence.csv
 
 # Requires contract size and leverage verified for the exact broker account/instrument
 PYTHONPATH=src python -m xau_intel.cli account-backtest --csv data/hist_XAUUSD_M1_a.csv \
