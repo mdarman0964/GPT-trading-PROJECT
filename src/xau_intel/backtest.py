@@ -58,6 +58,8 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
     low = df["low"].to_numpy(dtype=float)
     close = df["close"].to_numpy(dtype=float)
     times = df["time"].astype(str).to_numpy()
+    times_dt = pd.to_datetime(df["time"]).to_numpy()
+    one_minute = pd.Timedelta(minutes=1).to_timedelta64()
     spread_ratio = df["spread_to_atr"].to_numpy(dtype=float)
     n = len(df)
     i = 0
@@ -72,6 +74,11 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
             continue
 
         entry_i = i + 1
+        # Do not treat the first candle after a market/data outage as the
+        # immediate next-minute entry. There was no observable M1 bar.
+        if times_dt[entry_i] - times_dt[i] != one_minute:
+            i += 1
+            continue
         entry_mid = float(open_[entry_i])
         entry_spread = float(spread[entry_i])
         half_entry_cost = entry_spread / 2.0 + cfg.slippage_per_side + cfg.commission_per_side
@@ -92,6 +99,12 @@ def _simulate_stream(df: pd.DataFrame, signal_col: str, side: int,
 
         for j in range(entry_i, last_i + 1):
             o, h, l = float(open_[j]), float(high[j]), float(low[j])
+            # If data/market time jumps while a position is open, assume the
+            # position exits at the first observable open after the gap.
+            # This avoids silently simulating through missing candles.
+            if j > entry_i and times_dt[j] - times_dt[j - 1] > one_minute:
+                exit_i, exit_mid, exit_reason = j, o, "data_gap_exit"
+                break
             if side == 1:
                 if o <= stop_level:
                     exit_i, exit_mid, exit_reason = j, o, "stop_gap"
