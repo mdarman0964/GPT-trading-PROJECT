@@ -19,7 +19,7 @@ class MarketIntelligenceTests(unittest.TestCase):
         self.assertTrue(pd.isna(out.loc[11,"confirmed_swing_high_event"])); self.assertEqual(out.loc[12,"confirmed_swing_high_event"],2010)
     def test_fvg_does_not_cross_gap(self):
         times=list(pd.date_range("2026-01-01",periods=3,freq="min"))+list(pd.date_range("2026-01-01 00:10",periods=3,freq="min"))
-        df=sample(times); df.loc[2,"high"]=2100; df.loc[3,"low"]=2200
+        df=sample(times); df.loc[2,"high"]=2100; df.loc[3,"low"]=2200; df.loc[3,"open"]=2200.5; df.loc[3,"close"]=2200.5; df.loc[3,"high"]=2201
         out=build_market_intelligence(df,IntelligenceConfig(swing_left=1,swing_right=1,liquidity_lookback=5))
         self.assertFalse(bool(out.loc[3,"bullish_fvg"]))
     def test_negative_volume_rejected(self):
